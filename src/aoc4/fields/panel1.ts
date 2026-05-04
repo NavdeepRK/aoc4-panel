@@ -1,0 +1,92 @@
+// AUTO-GENERATED from .artifacts/aoc4-panel1AOC4-fields.json
+// Re-run `npm run aoc4:walk` to regenerate.
+
+export const PANEL1_FIELDS = {
+  "CIN_Number_Professional_User": { type: "guideTextBox", som: "guide[0].guide1[0].guideRootPanel[0].mainPanel[0].block1[0].panel1AOC4[0].generalInformationPanel[0].generalInformationInnerPanel[0].panel1650634217493[0].CIN_Number_Professional_User[0]" },
+  "companyNamesSearch": { type: "guideDropDownList", som: "guide[0].guide1[0].guideRootPanel[0].mainPanel[0].block1[0].panel1AOC4[0].generalInformationPanel[0].generalInformationInnerPanel[0].panel1650634217493[0].companyNamesSearch[0]" },
+  "companySearchBox": { type: "guideTextBox", som: "guide[0].guide1[0].guideRootPanel[0].mainPanel[0].block1[0].panel1AOC4[0].generalInformationPanel[0].generalInformationInnerPanel[0].panel1650634217493[0].companyNameModalContainer[0].panel1613401524275[0].companySearchBox[0]" },
+  "CINofCompany": { type: "guideTextBox", som: "guide[0].guide1[0].guideRootPanel[0].mainPanel[0].block1[0].panel1AOC4[0].generalInformationPanel[0].generalInformationInnerPanel[0].CINofCompany[0]" },
+  "CIN_Number_Other_User": { type: "guideDropDownList", som: "guide[0].guide1[0].guideRootPanel[0].mainPanel[0].block1[0].panel1AOC4[0].generalInformationPanel[0].generalInformationInnerPanel[0].CIN_Number_Other_User[0]" },
+  "authorizedCapitalOfCompany": { type: "guideTextBox", som: "guide[0].guide1[0].guideRootPanel[0].mainPanel[0].block1[0].panel1AOC4[0].generalInformationPanel[0].generalInformationInnerPanel[0].authorizedCapitalOfCompany[0]" },
+  "numberOfMembers": { type: "guideTextBox", som: "guide[0].guide1[0].guideRootPanel[0].mainPanel[0].block1[0].panel1AOC4[0].generalInformationPanel[0].generalInformationInnerPanel[0].numberOfMembers[0]" },
+  "userTypeHidden": { type: "guideTextBox", som: "guide[0].guide1[0].guideRootPanel[0].mainPanel[0].block1[0].panel1AOC4[0].generalInformationPanel[0].generalInformationInnerPanel[0].userTypeHidden[0]" },
+  "savedCinVal": { type: "guideTextBox", som: "guide[0].guide1[0].guideRootPanel[0].mainPanel[0].block1[0].panel1AOC4[0].generalInformationPanel[0].generalInformationInnerPanel[0].savedCinVal[0]" },
+  "nameOfCompany": { type: "guideTextBox", som: "guide[0].guide1[0].guideRootPanel[0].mainPanel[0].block1[0].panel1AOC4[0].generalOuterPanel1[0].generalInnerPanel1[0].nameOfCompany[0]" },
+  "addressOfRegisterCompany": { type: "guideTextBox", som: "guide[0].guide1[0].guideRootPanel[0].mainPanel[0].block1[0].panel1AOC4[0].generalOuterPanel1[0].generalInnerPanel1[0].addressOfRegisterCompany[0]" },
+  "emailIDofCompany": { type: "guideTextBox", som: "guide[0].guide1[0].guideRootPanel[0].mainPanel[0].block1[0].panel1AOC4[0].generalOuterPanel1[0].generalInnerPanel1[0].emailIDofCompany[0]" },
+  "fromDate": { type: "guideDatePicker", som: "guide[0].guide1[0].guideRootPanel[0].mainPanel[0].block1[0].panel1AOC4[0].generalOuterPanel2[0].generalInnerPanel2[0].fromDate[0]" },
+  "toDate": { type: "guideDatePicker", som: "guide[0].guide1[0].guideRootPanel[0].mainPanel[0].block1[0].panel1AOC4[0].generalOuterPanel2[0].generalInnerPanel2[0].toDate[0]" },
+  "textbox1643785189026": { type: "guideDatePicker", som: "guide[0].guide1[0].guideRootPanel[0].mainPanel[0].block1[0].panel1AOC4[0].signatoryDetailsPanel[0].signatoryDetailsnnerPanel[0].textbox1643785189026[0]" },
+  "dateOfAdjAGM": { type: "guideDatePicker", som: "guide[0].guide1[0].guideRootPanel[0].mainPanel[0].block1[0].panel1AOC4[0].signatoryDetailsPanel[0].signatoryDetailsnnerPanel[0].generalInnerPanel3[0].dateOfAdjAGM[0]" },
+  "SRNofFormINC": { type: "guideTextBox", som: "guide[0].guide1[0].guideRootPanel[0].mainPanel[0].block1[0].panel1AOC4[0].signatoryDetailsPanel[0].signatoryDetailsnnerPanel[0].generalInnerPanel3[0].SRNofFormINC[0]" },
+  "srnOfFormAOC": { type: "guideTextBox", som: "guide[0].guide1[0].guideRootPanel[0].mainPanel[0].block1[0].panel1AOC4[0].signatoryDetailsPanel[0].signatoryDetailsnnerPanel[0].generalInnerPanel3[0].srnOfFormAOC[0]" },
+  "dateOfOrderOfCompetent": { type: "guideDatePicker", som: "guide[0].guide1[0].guideRootPanel[0].mainPanel[0].block1[0].panel1AOC4[0].signatoryDetailsPanel[0].signatoryDetailsnnerPanel[0].generalInnerPanel3[0].dateOfOrderOfCompetent[0]" },
+  "DINorIncome": { type: "guideTextBox", soms: [
+    "guide[0].guide1[0].guideRootPanel[0].mainPanel[0].block1[0].panel1AOC4[0].signatoryDetailsPanel[0].signatoryDetailsnnerPanel[0].dynamicTable1[0].Row1[0].DINorIncome[0]",
+    "guide[0].guide1[0].guideRootPanel[0].mainPanel[0].block1[0].panel1AOC4[0].signatoryDetailsPanel[0].signatoryDetailsnnerPanel[0].dynamicTable1[0].Row1[1].DINorIncome[0]",
+    "guide[0].guide1[0].guideRootPanel[0].mainPanel[0].block1[0].panel1AOC4[0].signatoryDetailsPanel[0].signatoryDetailsnnerPanel[0].dynamicTable1[0].Row1[2].DINorIncome[0]",
+    "guide[0].guide1[0].guideRootPanel[0].mainPanel[0].block1[0].panel1AOC4[0].signatoryDetailsPanel[0].signatoryDetailsnnerPanel[0].dynamicTable1[0].Row1[3].DINorIncome[0]",
+    "guide[0].guide1[0].guideRootPanel[0].mainPanel[0].block1[0].panel1AOC4[0].signatoryDetailsPanel[0].signatoryDetailsnnerPanel[0].dynamicTable1[0].Row1[4].DINorIncome[0]",
+  ] },
+  "name": { type: "guideTextBox", soms: [
+    "guide[0].guide1[0].guideRootPanel[0].mainPanel[0].block1[0].panel1AOC4[0].signatoryDetailsPanel[0].signatoryDetailsnnerPanel[0].dynamicTable1[0].Row1[0].name[0]",
+    "guide[0].guide1[0].guideRootPanel[0].mainPanel[0].block1[0].panel1AOC4[0].signatoryDetailsPanel[0].signatoryDetailsnnerPanel[0].dynamicTable1[0].Row1[1].name[0]",
+    "guide[0].guide1[0].guideRootPanel[0].mainPanel[0].block1[0].panel1AOC4[0].signatoryDetailsPanel[0].signatoryDetailsnnerPanel[0].dynamicTable1[0].Row1[2].name[0]",
+    "guide[0].guide1[0].guideRootPanel[0].mainPanel[0].block1[0].panel1AOC4[0].signatoryDetailsPanel[0].signatoryDetailsnnerPanel[0].dynamicTable1[0].Row1[3].name[0]",
+    "guide[0].guide1[0].guideRootPanel[0].mainPanel[0].block1[0].panel1AOC4[0].signatoryDetailsPanel[0].signatoryDetailsnnerPanel[0].dynamicTable1[0].Row1[4].name[0]",
+  ] },
+  "hiddenError": { type: "guideTextBox", soms: [
+    "guide[0].guide1[0].guideRootPanel[0].mainPanel[0].block1[0].panel1AOC4[0].signatoryDetailsPanel[0].signatoryDetailsnnerPanel[0].dynamicTable1[0].Row1[0].hiddenError[0]",
+    "guide[0].guide1[0].guideRootPanel[0].mainPanel[0].block1[0].panel1AOC4[0].signatoryDetailsPanel[0].signatoryDetailsnnerPanel[0].dynamicTable1[0].Row1[1].hiddenError[0]",
+    "guide[0].guide1[0].guideRootPanel[0].mainPanel[0].block1[0].panel1AOC4[0].signatoryDetailsPanel[0].signatoryDetailsnnerPanel[0].dynamicTable1[0].Row1[2].hiddenError[0]",
+    "guide[0].guide1[0].guideRootPanel[0].mainPanel[0].block1[0].panel1AOC4[0].signatoryDetailsPanel[0].signatoryDetailsnnerPanel[0].dynamicTable1[0].Row1[3].hiddenError[0]",
+    "guide[0].guide1[0].guideRootPanel[0].mainPanel[0].block1[0].panel1AOC4[0].signatoryDetailsPanel[0].signatoryDetailsnnerPanel[0].dynamicTable1[0].Row1[4].hiddenError[0]",
+  ] },
+  "table1designation": { type: "guideTextBox", soms: [
+    "guide[0].guide1[0].guideRootPanel[0].mainPanel[0].block1[0].panel1AOC4[0].signatoryDetailsPanel[0].signatoryDetailsnnerPanel[0].dynamicTable1[0].Row1[0].table1designation[0]",
+    "guide[0].guide1[0].guideRootPanel[0].mainPanel[0].block1[0].panel1AOC4[0].signatoryDetailsPanel[0].signatoryDetailsnnerPanel[0].dynamicTable1[0].Row1[1].table1designation[0]",
+    "guide[0].guide1[0].guideRootPanel[0].mainPanel[0].block1[0].panel1AOC4[0].signatoryDetailsPanel[0].signatoryDetailsnnerPanel[0].dynamicTable1[0].Row1[2].table1designation[0]",
+    "guide[0].guide1[0].guideRootPanel[0].mainPanel[0].block1[0].panel1AOC4[0].signatoryDetailsPanel[0].signatoryDetailsnnerPanel[0].dynamicTable1[0].Row1[3].table1designation[0]",
+    "guide[0].guide1[0].guideRootPanel[0].mainPanel[0].block1[0].panel1AOC4[0].signatoryDetailsPanel[0].signatoryDetailsnnerPanel[0].dynamicTable1[0].Row1[4].table1designation[0]",
+  ] },
+  "DateOfSigning": { type: "guideDatePicker", soms: [
+    "guide[0].guide1[0].guideRootPanel[0].mainPanel[0].block1[0].panel1AOC4[0].signatoryDetailsPanel[0].signatoryDetailsnnerPanel[0].dynamicTable1[0].Row1[0].DateOfSigning[0]",
+    "guide[0].guide1[0].guideRootPanel[0].mainPanel[0].block1[0].panel1AOC4[0].signatoryDetailsPanel[0].signatoryDetailsnnerPanel[0].dynamicTable1[0].Row1[1].DateOfSigning[0]",
+    "guide[0].guide1[0].guideRootPanel[0].mainPanel[0].block1[0].panel1AOC4[0].signatoryDetailsPanel[0].signatoryDetailsnnerPanel[0].dynamicTable1[0].Row1[2].DateOfSigning[0]",
+    "guide[0].guide1[0].guideRootPanel[0].mainPanel[0].block1[0].panel1AOC4[0].signatoryDetailsPanel[0].signatoryDetailsnnerPanel[0].dynamicTable1[0].Row1[3].DateOfSigning[0]",
+    "guide[0].guide1[0].guideRootPanel[0].mainPanel[0].block1[0].panel1AOC4[0].signatoryDetailsPanel[0].signatoryDetailsnnerPanel[0].dynamicTable1[0].Row1[4].DateOfSigning[0]",
+  ] },
+  "DateOfBoard": { type: "guideDatePicker", som: "guide[0].guide1[0].guideRootPanel[0].mainPanel[0].block1[0].panel1AOC4[0].dynamicTableSecondPanel[0].dynamicTableSecondPanel[0].DateOfBoard[0]" },
+  "din": { type: "guideTextBox", soms: [
+    "guide[0].guide1[0].guideRootPanel[0].mainPanel[0].block1[0].panel1AOC4[0].dynamicTableSecondPanel[0].dynamicTableSecondPanel[0].table2[0].Row1[0].din[0]",
+    "guide[0].guide1[0].guideRootPanel[0].mainPanel[0].block1[0].panel1AOC4[0].dynamicTableSecondPanel[0].dynamicTableSecondPanel[0].table2[0].Row1[1].din[0]",
+    "guide[0].guide1[0].guideRootPanel[0].mainPanel[0].block1[0].panel1AOC4[0].dynamicTableSecondPanel[0].dynamicTableSecondPanel[0].table2[0].Row1[2].din[0]",
+  ] },
+  "name1": { type: "guideTextBox", soms: [
+    "guide[0].guide1[0].guideRootPanel[0].mainPanel[0].block1[0].panel1AOC4[0].dynamicTableSecondPanel[0].dynamicTableSecondPanel[0].table2[0].Row1[0].name1[0]",
+    "guide[0].guide1[0].guideRootPanel[0].mainPanel[0].block1[0].panel1AOC4[0].dynamicTableSecondPanel[0].dynamicTableSecondPanel[0].table2[0].Row1[1].name1[0]",
+    "guide[0].guide1[0].guideRootPanel[0].mainPanel[0].block1[0].panel1AOC4[0].dynamicTableSecondPanel[0].dynamicTableSecondPanel[0].table2[0].Row1[2].name1[0]",
+  ] },
+  "hiddenError1": { type: "guideTextBox", soms: [
+    "guide[0].guide1[0].guideRootPanel[0].mainPanel[0].block1[0].panel1AOC4[0].dynamicTableSecondPanel[0].dynamicTableSecondPanel[0].table2[0].Row1[0].hiddenError1[0]",
+    "guide[0].guide1[0].guideRootPanel[0].mainPanel[0].block1[0].panel1AOC4[0].dynamicTableSecondPanel[0].dynamicTableSecondPanel[0].table2[0].Row1[1].hiddenError1[0]",
+    "guide[0].guide1[0].guideRootPanel[0].mainPanel[0].block1[0].panel1AOC4[0].dynamicTableSecondPanel[0].dynamicTableSecondPanel[0].table2[0].Row1[2].hiddenError1[0]",
+  ] },
+  "table2designation": { type: "guideTextBox", soms: [
+    "guide[0].guide1[0].guideRootPanel[0].mainPanel[0].block1[0].panel1AOC4[0].dynamicTableSecondPanel[0].dynamicTableSecondPanel[0].table2[0].Row1[0].table2designation[0]",
+    "guide[0].guide1[0].guideRootPanel[0].mainPanel[0].block1[0].panel1AOC4[0].dynamicTableSecondPanel[0].dynamicTableSecondPanel[0].table2[0].Row1[1].table2designation[0]",
+    "guide[0].guide1[0].guideRootPanel[0].mainPanel[0].block1[0].panel1AOC4[0].dynamicTableSecondPanel[0].dynamicTableSecondPanel[0].table2[0].Row1[2].table2designation[0]",
+  ] },
+  "DateOfSigningOfBoard": { type: "guideDatePicker", soms: [
+    "guide[0].guide1[0].guideRootPanel[0].mainPanel[0].block1[0].panel1AOC4[0].dynamicTableSecondPanel[0].dynamicTableSecondPanel[0].table2[0].Row1[0].DateOfSigningOfBoard[0]",
+    "guide[0].guide1[0].guideRootPanel[0].mainPanel[0].block1[0].panel1AOC4[0].dynamicTableSecondPanel[0].dynamicTableSecondPanel[0].table2[0].Row1[1].DateOfSigningOfBoard[0]",
+    "guide[0].guide1[0].guideRootPanel[0].mainPanel[0].block1[0].panel1AOC4[0].dynamicTableSecondPanel[0].dynamicTableSecondPanel[0].table2[0].Row1[2].DateOfSigningOfBoard[0]",
+  ] },
+  "dateOfSigningOfReports": { type: "guideDatePicker", som: "guide[0].guide1[0].guideRootPanel[0].mainPanel[0].block1[0].panel1AOC4[0].agmDetailsPanel[0].dateOfSigningOfReports[0]" },
+  "ifyesDateOfAGM": { type: "guideDatePicker", som: "guide[0].guide1[0].guideRootPanel[0].mainPanel[0].block1[0].panel1AOC4[0].agmDetailsPanel[0].agmDetailsInnerPanel[0].ifyesDateOfAGM[0]" },
+  "dueDateOfAGM": { type: "guideDatePicker", som: "guide[0].guide1[0].guideRootPanel[0].mainPanel[0].block1[0].panel1AOC4[0].agmDetailsPanel[0].agmDetailsInnerPanel[0].dueDateOfAGM[0]" },
+  "SRNOfGNL1": { type: "guideTextBox", som: "guide[0].guide1[0].guideRootPanel[0].mainPanel[0].block1[0].panel1AOC4[0].agmDetailsPanel[0].agmDetailsInnerPanel[0].SRNOfGNL1[0]" },
+  "dueDateOfAGM1": { type: "guideDatePicker", som: "guide[0].guide1[0].guideRootPanel[0].mainPanel[0].block1[0].panel1AOC4[0].agmDetailsPanel[0].agmDetailsInnerPanel[0].dueDateOfAGM1[0]" },
+} as const;
+
+export type Panel1FieldName = keyof typeof PANEL1_FIELDS;

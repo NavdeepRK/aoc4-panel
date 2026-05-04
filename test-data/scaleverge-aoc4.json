@@ -1,0 +1,22 @@
+{
+  "_meta": {
+    "entity": "SCALEVERGE SOLUTIONS PRIVATE LIMITED",
+    "cin": "U62090HR2025PTC132910",
+    "_note": "Test data only. The current logged-in account is NOT authorized for this CIN; do NOT attempt actual filing without a Business User account associated with this entity.",
+    "directors": [
+      { "din": "11142612", "name": "SURBHI", "designation": "Director", "appointmentDate": "06/06/2025" },
+      { "din": "11142613", "name": "BANOTH VINOD KUMAR", "designation": "Director", "appointmentDate": "06/06/2025" }
+    ]
+  },
+  "cin": "U62090HR2025PTC132910",
+  "panel1": {
+    "CIN_Number_Professional_User": "U62090HR2025PTC132910",
+    "nameOfCompany": "SCALEVERGE SOLUTIONS PRIVATE LIMITED",
+    "fromDate": "01/04/2024",
+    "toDate": "31/03/2025",
+    "DINorIncome": "11142612",
+    "name": "SURBHI",
+    "table1designation": "Director",
+    "DateOfSigning": "06/06/2025"
+  }
+}

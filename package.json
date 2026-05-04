@@ -1,0 +1,39 @@
+{
+  "name": "mca-filing-service",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Browser automation for MCA V3 portal filings (AOC-4, MGT-7, etc.)",
+  "scripts": {
+    "login": "tsx src/cli.ts login",
+    "register": "tsx src/cli.ts register",
+    "explore": "tsx src/cli.ts explore",
+    "aoc4:open": "tsx src/cli.ts aoc4:open",
+    "aoc4:walk": "tsx src/cli.ts aoc4:walk",
+    "aoc4:capture": "tsx src/cli.ts aoc4:capture",
+    "aoc4:prefill": "tsx src/cli.ts aoc4:prefill",
+    "aoc4:fill": "tsx src/cli.ts aoc4:fill",
+    "dir:lookup": "tsx src/cli/dir-lookup.ts",
+    "dir:companies": "tsx src/cli/companies-by-din.ts",
+    "serve": "tsx src/server/index.ts",
+    "aoc4:inspect-panel2": "tsx src/cli/aoc4-inspect-panel2.ts",
+    "aoc4:find-pdf-url": "tsx src/cli/aoc4-find-pdf-url.ts",
+    "aoc4:discover-app-page": "tsx src/cli/aoc4-discover-app-page.ts",
+    "aoc4:pdf-trace": "tsx src/cli/aoc4-pdf-trace.ts",
+    "aoc4:pdf-discover-postsave": "tsx src/cli/aoc4-pdf-discover-postsave.ts",
+    "aoc4:complete-and-pdf": "tsx src/cli/aoc4-complete-and-pdf.ts",
+    "aoc4:resume-and-pdf": "tsx src/cli/aoc4-resume-and-pdf.ts",
+    "aoc4:natural-walkthrough": "tsx src/cli/aoc4-natural-walkthrough.ts",
+    "aoc4:live-fill": "tsx src/cli/aoc4-live-fill.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "openai": "^4.77.0",
+    "playwright": "^1.50.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.0"
+  }
+}

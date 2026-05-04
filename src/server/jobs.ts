@@ -1,0 +1,187 @@
+/**
+ * In-memory job state for AOC-4 filings.
+ *
+ * Each job represents one in-flight AOC-4 filing for a specific CIN. It carries:
+ *   - Current phase (the state machine: PENDING → DRAFT_CREATED → … → FILED)
+ *   - Captured Siebel SR Id (assigned on first save)
+ *   - Browser handle (kept alive between phases — session reuse avoids re-login)
+ *   - Artifacts (draft PDF path, signed PDF buffer, server SRN, errors)
+ *
+ * Restart behavior: in-memory only. If the service restarts, jobs are lost.
+ * Production should persist state to a DB, but for the MVP this matches the
+ * INC-20A pattern (which also stores `jobId` in `GovernmentApplication.metadata`
+ * and assumes the worker has the in-memory state).
+ */
+
+import type { Browser, Page } from 'playwright';
+
+export type Aoc4Phase =
+  | 'PENDING'             // job created, browser not yet launched
+  | 'LOGGING_IN'          // re-using or refreshing the MCA session
+  | 'LOADING_FORM'        // form load + bridge connect
+  | 'PREFILLING'          // prefillWithCin in flight
+  | 'FILLING_PANEL'       // setProperty calls in progress (panel index in `panelInProgress`)
+  | 'SAVING_PANEL'        // commonSaveSubmit in flight
+  | 'DRAFT_CREATED'       // panels 1-7 saved, SR id captured, awaiting human DSC step
+  | 'PDF_DOWNLOADED'      // draft PDF pulled from MCA, available to client
+  | 'AWAITING_SIGNATURE'  // PDF handed off to admin for DSC signing
+  | 'UPLOADING_SIGNED'    // signed PDF being pushed to MCA
+  | 'FILED'               // MCA accepted the filing, SRN assigned
+  | 'FAILED';             // unrecoverable error (see `error`)
+
+export interface Aoc4FormPayload {
+  cin: string;
+  /** Financial year window — ISO yyyy-MM-dd */
+  financialYearFrom: string;
+  financialYearTo: string;
+  /** Board meeting + signing dates — ISO */
+  boardMeetingFsApprovalDate: string;
+  boardMeetingReportDate: string;
+  auditorSigningDate: string;
+  agmDate: string;
+  agmDueDate: string;
+  numberOfMembers: number;
+  /** Directors — DIN strings, the form looks up names + designations via mgt7getDinDetails */
+  directors: Array<{ din: string; designation: string }>;
+  /** Index of the FS-signing director within `directors[]` (defaults to 0) */
+  fsSignerDirectorIndex?: number;
+  /** Auditor info — see preset for fields */
+  auditor?: {
+    srnOfAdt1?: string;
+    pan?: string;
+    category?: 'Individual' | "Auditor's firm";
+    membershipNumber?: string;
+    name?: string;
+    address?: { line1: string; line2?: string; country: string; pincode: string; city: string; district?: string; state: string };
+    signingMember?: { name: string; membershipNumber: string };
+  };
+  /** Balance sheet (minimum: cash + share capital, balanced) */
+  balanceSheet?: { shareCapital: number; reserves: number; cashAndEquivalents: number };
+  /**
+   * Schedule III balance sheet rows (current FY + previous FY). Field names mirror
+   * the AOC-4 form's panel 3 row identifiers — see aoc4-worker.ts → applyPanel3Overrides.
+   * Any field omitted falls back to the generic-fill default (0.00).
+   */
+  scheduleIII?: {
+    /** Equity & Liabilities */
+    equityShareCapital?: { current: number; previous?: number };
+    otherEquity?: { current: number; previous?: number };
+    longTermBorrowings?: { current: number; previous?: number };
+    shortTermBorrowings?: { current: number; previous?: number };
+    tradePayables?: { current: number; previous?: number };
+    /** Assets */
+    propertyPlantEquipment?: { current: number; previous?: number };
+    intangibleAssets?: { current: number; previous?: number };
+    investments?: { current: number; previous?: number };
+    inventories?: { current: number; previous?: number };
+    tradeReceivables?: { current: number; previous?: number };
+    cashAndCashEquivalents?: { current: number; previous?: number };
+  };
+  /** Profit & Loss summary (panel 4) */
+  profitAndLoss?: {
+    revenueFromOperations?: { current: number; previous?: number };
+    otherIncome?: { current: number; previous?: number };
+    totalRevenue?: { current: number; previous?: number };
+    totalExpenses?: { current: number; previous?: number };
+    profitBeforeTax?: { current: number; previous?: number };
+    profitAfterTax?: { current: number; previous?: number };
+  };
+  /**
+   * Direct field-name overrides per panel — applied after generic fill, before save.
+   * Use this when you know the exact AEM field name + value (e.g. from a live form walk).
+   * Field names are the SOM-tree `name` property, not the bound-data names.
+   *
+   * Example:
+   *   panelOverrides: {
+   *     panel3: { FiguresAtEndOfCurrentReporting1: '50000', figuresAsEndOfPreviousReporting1: '0' },
+   *     panel4: { ... }
+   *   }
+   */
+  panelOverrides?: Partial<Record<'panel1' | 'panel2' | 'panel3' | 'panel4' | 'panel5' | 'panel6' | 'panel7', Record<string, string | number>>>;
+  /** Whether to override gb.validate to bypass cross-panel validation. Default true (proven required for partial saves). */
+  bypassValidation?: boolean;
+}
+
+export interface Aoc4Job {
+  jobId: string;
+  cin: string;
+  phase: Aoc4Phase;
+  /** Siebel SR Id (e.g., "1-BNRAQGG"). Set on first successful panel save. */
+  /** Siebel internal id (short, e.g. "1-BNSWT19") — used for backend lookups */
+  srId?: string;
+  /** MCA reference number (long numeric, e.g. "1-25383887613") — what shows in My Application */
+  referenceNumber?: string;
+  /**
+   * Resume URL — paste into a logged-in MCA browser to open the draft and continue filing.
+   * Constructed from { srn, reference, purpose, integrationId } base64-encoded into the
+   * `applicationHistory` query param. Discovered live 2026-05-02.
+   */
+  resumeUrl?: string;
+  /** Final SRN assigned after submission. */
+  filingSrn?: string;
+  /** Last error, if any. Cleared on successful phase transition. */
+  error?: string;
+  /** UNIX ms timestamp of the most recent state transition. */
+  lastEventAt: number;
+  createdAt: number;
+  payload: Aoc4FormPayload;
+  /** Path to the downloaded draft PDF on disk, if available. */
+  draftPdfPath?: string;
+  /** Path where the admin-uploaded signed PDF is staged. */
+  signedPdfPath?: string;
+  /** Per-panel save outcomes for diagnostics */
+  panelResults: Array<{ panel: number; ok: boolean; srId?: string; error?: string }>;
+  /** Internal: current panel being processed (for monitoring only) */
+  panelInProgress?: number;
+  /** Internal: live browser handle. Kept alive across HTTP requests. */
+  _browser?: Browser;
+  _page?: Page;
+}
+
+const jobs = new Map<string, Aoc4Job>();
+
+export function createJob(jobId: string, payload: Aoc4FormPayload): Aoc4Job {
+  const now = Date.now();
+  const job: Aoc4Job = {
+    jobId,
+    cin: payload.cin,
+    phase: 'PENDING',
+    lastEventAt: now,
+    createdAt: now,
+    payload,
+    panelResults: [],
+  };
+  jobs.set(jobId, job);
+  return job;
+}
+
+export function getJob(jobId: string): Aoc4Job | undefined {
+  return jobs.get(jobId);
+}
+
+export function setPhase(jobId: string, phase: Aoc4Phase, extra?: Partial<Aoc4Job>): Aoc4Job {
+  const j = jobs.get(jobId);
+  if (!j) throw new Error(`job ${jobId} not found`);
+  j.phase = phase;
+  j.lastEventAt = Date.now();
+  if (extra) Object.assign(j, extra);
+  return j;
+}
+
+/** Public-safe view (strips internal browser handles) for HTTP responses. */
+export function publicView(j: Aoc4Job): Omit<Aoc4Job, '_browser' | '_page'> {
+  const { _browser: _b, _page: _p, ...rest } = j;
+  return rest;
+}
+
+export function listJobs(): Aoc4Job[] {
+  return [...jobs.values()];
+}
+
+/** Drop a job + its browser. Idempotent. */
+export async function disposeJob(jobId: string): Promise<void> {
+  const j = jobs.get(jobId);
+  if (!j) return;
+  try { await j._browser?.close(); } catch { /* already closed */ }
+  jobs.delete(jobId);
+}
