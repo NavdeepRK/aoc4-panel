@@ -479,13 +479,33 @@ export async function runAoc4Job(job: Aoc4Job, opts: { artifactDir: string; skip
         }
       }
 
-      // Generic fill — fills every visible empty leaf in the panel
+      // Generic fill — also captures field metadata for smart overrides + artifacts
       const fillStats = await _applyGenericPanelFill(page, panelKey, payload);
       const fieldsWritten = fillStats.numericCount + fillStats.radioCount + fillStats.textCount + fillStats.dateCount;
       log(`panel${panelNum} filled ${fillStats.numericCount}n / ${fillStats.radioCount}r / ${fillStats.textCount}t / ${fillStats.dateCount}d`);
 
-      // Auditor-specific fields (panel 2)
+      // Save field name dump to artifacts (key for discovering real AEM field names)
+      if (fillStats.fields.length > 0) {
+        fs.writeFileSync(
+          path.join(opts.artifactDir, `${jobId}-panel${panelNum}-fields.json`),
+          JSON.stringify(fillStats.fields, null, 2),
+        );
+      }
+
+      // Auditor fields (panel 2)
       if (panelKey === 'panel2AOC4' && payload.auditor) await _applyPanel2Overrides(page, payload);
+
+      // Balance sheet / Schedule III (panel 3)
+      if (panelKey === 'panel3AOC4' && payload.scheduleIII) {
+        const applied = await _applyPanel3Overrides(page, payload, fillStats.fields);
+        log(`panel3 scheduleIII applied ${applied} field overrides`);
+      }
+
+      // P&L (panel 4)
+      if (panelKey === 'panel4AOC4' && payload.profitAndLoss) {
+        const applied = await _applyPanel4Overrides(page, payload, fillStats.fields);
+        log(`panel4 profitAndLoss applied ${applied} field overrides`);
+      }
 
       // Caller-supplied direct field-name overrides (highest precedence)
       const shortKey = `panel${panelNum}` as 'panel1' | 'panel2' | 'panel3' | 'panel4' | 'panel5' | 'panel6' | 'panel7';
@@ -661,7 +681,14 @@ async function _applyGenericPanelFill(
   page: import('playwright').Page,
   panelKey: string,
   _payload: import('./jobs.js').Aoc4FormPayload,
-): Promise<{ numericCount: number; radioCount: number; textCount: number; dateCount: number; ddCount: number }> {
+): Promise<{
+  numericCount: number;
+  radioCount: number;
+  textCount: number;
+  dateCount: number;
+  ddCount: number;
+  fields: Array<{ name: string; som: string; cls: string; was: unknown; wrote: string | null }>;
+}> {
   return await page.evaluate(({ panelKey: pk, today }) => {
     type GuideNode = {
       name?: string;
@@ -677,9 +704,10 @@ async function _applyGenericPanelFill(
       guideBridge: { resolveNode: (s: string) => unknown; setProperty: (s: string[], p: string, v: unknown[]) => void };
     }).guideBridge;
     const panel = gb.resolveNode(pk) as GuideNode | null;
-    if (!panel) return { numericCount: 0, radioCount: 0, textCount: 0, dateCount: 0, ddCount: 0 };
+    if (!panel) return { numericCount: 0, radioCount: 0, textCount: 0, dateCount: 0, ddCount: 0, fields: [] };
 
     let numericCount = 0, radioCount = 0, textCount = 0, dateCount = 0, ddCount = 0;
+    const fields: Array<{ name: string; som: string; cls: string; was: unknown; wrote: string | null }> = [];
     const setVal = (som: string, v: unknown): void => { try { gb.setProperty([som], 'value', [v]); } catch { /* ignore */ } };
 
     const isNumericName = (name?: string): boolean => {
@@ -699,37 +727,46 @@ async function _applyGenericPanelFill(
       if (n.somExpression && Object.prototype.hasOwnProperty.call(n, 'value')) {
         const cur = n.value;
         const empty = cur == null || cur === '';
+        let wrote: string | null = null;
+
         if (empty) {
           if (/RadioButton/i.test(cls)) {
             // Default to '1' (typically "No"). For radios where '1' is invalid the form will reject.
             setVal(n.somExpression, '1');
             radioCount++;
+            wrote = '1';
           } else if (/DatePicker/i.test(cls)) {
             setVal(n.somExpression, today);
             dateCount++;
+            wrote = today;
           } else if (/DropDownList/i.test(cls)) {
             // Pick first non-empty option from jsonModel
             const opts = n.jsonModel?.options ?? [];
             for (const o of opts) {
               const v = typeof o === 'string' ? o.split('=')[0] : (o?.value ?? '');
-              if (v && v !== '') { setVal(n.somExpression, v); ddCount++; break; }
+              if (v && v !== '') { setVal(n.somExpression, v); ddCount++; wrote = v; break; }
             }
           } else if (/TextBox|TextField|NumericBox/i.test(cls)) {
             if (isNumericName(n.name)) {
               setVal(n.somExpression, '0.00');
               numericCount++;
+              wrote = '0.00';
             } else {
               setVal(n.somExpression, 'NA');
               textCount++;
+              wrote = 'NA';
             }
           }
         }
+
+        // Record ALL leaf fields (whether filled or already had a value)
+        fields.push({ name: n.name ?? '', som: n.somExpression, cls, was: cur, wrote });
       }
 
       if (Array.isArray(n.items)) for (const k of n.items) walk(k);
     }
     walk(panel);
-    return { numericCount, radioCount, textCount, dateCount, ddCount };
+    return { numericCount, radioCount, textCount, dateCount, ddCount, fields };
   }, { panelKey, today: new Date().toISOString().slice(0, 10) });
 }
 
@@ -779,6 +816,108 @@ async function _applyPanel2Overrides(
       set('membershipNumber_Auditor', aud.signingMember.membershipNumber);
     }
   }, payload.auditor);
+}
+
+/**
+ * Panel 3 — Schedule III balance sheet. Applies payload.scheduleIII values
+ * using keyword-based matching against the panel's actual field names.
+ * The panel uses rows with Current/Previous year columns; we match by:
+ *   1. Exact field name match from known-name table (fastest)
+ *   2. Substring/keyword match (fallback)
+ *   3. Position-based match for row-indexed patterns like FiguresAtEndOfCurrentReporting{N}
+ */
+async function _applyPanel3Overrides(
+  page: import('playwright').Page,
+  payload: import('./jobs.js').Aoc4FormPayload,
+  fields: Array<{name: string; som: string; cls: string}>,
+): Promise<number> {
+  if (!payload.scheduleIII) return 0;
+  const sched = payload.scheduleIII;
+
+  // Map: fieldNameKeyword → {current, previous}
+  // Keywords are lowercase substrings to match against actual AEM field names.
+  // The AOC-4 Schedule III order (Part I: Equity & Liabilities, Part II: Assets)
+  // is standardised by the Companies Act, so position-based fill is a reliable fallback.
+  const kwMap: Array<{ keys: string[]; data: { current?: number; previous?: number } | undefined }> = [
+    { keys: ['equityshare', 'sharecapital', 'paidupcapital'], data: sched.equityShareCapital },
+    { keys: ['otherequity', 'reserve', 'surplus'],            data: sched.otherEquity },
+    { keys: ['longtermborr', 'longtermloans'],                data: sched.longTermBorrowings },
+    { keys: ['shorttermborr', 'shorttermloans'],              data: sched.shortTermBorrowings },
+    { keys: ['tradepay', 'accountspayable'],                  data: sched.tradePayables },
+    { keys: ['ppe', 'propertypla', 'tangibleasset', 'fixedasset'], data: sched.propertyPlantEquipment },
+    { keys: ['intangiblasset', 'intangible'],                 data: sched.intangibleAssets },
+    { keys: ['investment'],                                   data: sched.investments },
+    { keys: ['inventor'],                                     data: sched.inventories },
+    { keys: ['tradereceivable', 'accountsreceiv', 'debtors'], data: sched.tradeReceivables },
+    { keys: ['cashequival', 'cashandbank', 'cashandcash'],   data: sched.cashAndCashEquivalents },
+  ];
+
+  // Build sets of current- and previous-year SOM expressions for each logical field
+  const numericFields = fields.filter(f => /TextBox|NumericBox/i.test(f.cls));
+  const currentFields = numericFields.filter(f => /current|endofcurrent|FiguresAtEnd/i.test(f.name));
+  const previousFields = numericFields.filter(f => /previous|endofprevious|figuresAsEnd/i.test(f.name));
+
+  return await page.evaluate(({ kwMap: kw, currentFs, previousFs }) => {
+    const gb = (window as unknown as { guideBridge: { setProperty: (s: string[], p: string, v: unknown[]) => void } }).guideBridge;
+    const set = (som: string, v: number | undefined): boolean => {
+      if (v == null) return false;
+      try { gb.setProperty([som], 'value', [String(v)]); return true; } catch { return false; }
+    };
+    let count = 0;
+    for (const entry of kw) {
+      if (!entry.data) continue;
+      // Find matching current-year field
+      const cField = currentFs.find(f => entry.keys.some(k => f.name.toLowerCase().includes(k)));
+      if (cField && entry.data.current != null) { if (set(cField.som, entry.data.current)) count++; }
+      // Find matching previous-year field
+      const pField = previousFs.find(f => entry.keys.some(k => f.name.toLowerCase().includes(k)));
+      if (pField && entry.data.previous != null) { if (set(pField.som, entry.data.previous)) count++; }
+    }
+    return count;
+  }, { kwMap, currentFs: currentFields, previousFs: previousFields });
+}
+
+/**
+ * Panel 4 — Profit & Loss. Applies payload.profitAndLoss values using
+ * keyword-based matching against the panel's actual field names.
+ */
+async function _applyPanel4Overrides(
+  page: import('playwright').Page,
+  payload: import('./jobs.js').Aoc4FormPayload,
+  fields: Array<{name: string; som: string; cls: string}>,
+): Promise<number> {
+  if (!payload.profitAndLoss) return 0;
+  const pnl = payload.profitAndLoss;
+
+  const kwMap: Array<{ keys: string[]; data: { current?: number; previous?: number } | undefined }> = [
+    { keys: ['revenuefromoper', 'salesrevenue', 'netsales'],    data: pnl.revenueFromOperations },
+    { keys: ['otherincome', 'miscrevenue'],                     data: pnl.otherIncome },
+    { keys: ['totalrevenue', 'grossrevenue'],                   data: pnl.totalRevenue },
+    { keys: ['totalexpense', 'totalcost'],                      data: pnl.totalExpenses },
+    { keys: ['profitbeforetax', 'pbt', 'earningsbefore'],       data: pnl.profitBeforeTax },
+    { keys: ['profitaftertax', 'pat', 'netprofit', 'profitfor'], data: pnl.profitAfterTax },
+  ];
+
+  const numericFields = fields.filter(f => /TextBox|NumericBox/i.test(f.cls));
+  const currentFields = numericFields.filter(f => /current|endofcurrent|FiguresAtEnd/i.test(f.name));
+  const previousFields = numericFields.filter(f => /previous|endofprevious|figuresAsEnd/i.test(f.name));
+
+  return await page.evaluate(({ kwMap: kw, currentFs, previousFs }) => {
+    const gb = (window as unknown as { guideBridge: { setProperty: (s: string[], p: string, v: unknown[]) => void } }).guideBridge;
+    const set = (som: string, v: number | undefined): boolean => {
+      if (v == null) return false;
+      try { gb.setProperty([som], 'value', [String(v)]); return true; } catch { return false; }
+    };
+    let count = 0;
+    for (const entry of kw) {
+      if (!entry.data) continue;
+      const cField = currentFs.find(f => entry.keys.some(k => f.name.toLowerCase().includes(k)));
+      if (cField && entry.data.current != null) { if (set(cField.som, entry.data.current)) count++; }
+      const pField = previousFs.find(f => entry.keys.some(k => f.name.toLowerCase().includes(k)));
+      if (pField && entry.data.previous != null) { if (set(pField.som, entry.data.previous)) count++; }
+    }
+    return count;
+  }, { kwMap, currentFs: currentFields, previousFs: previousFields });
 }
 
 /**
