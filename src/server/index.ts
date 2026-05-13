@@ -123,11 +123,16 @@ const server = http.createServer(async (req, res) => {
       fs.mkdirSync(artifactDir, { recursive: true });
 
       // Kick off the worker. Run in background — return job_id immediately so the caller can poll.
-      void runAoc4Job(job, { artifactDir }).catch((e: unknown) => {
-        const msg = e instanceof Error ? e.message : String(e);
-        process.stderr.write(`[server] job ${jobId} failed: ${msg}\n`);
-        try { setPhase(jobId, 'FAILED', { error: msg }); } catch { /* job may already be gone */ }
-      });
+      process.stdout.write(`[server] job ${jobId} started — CIN ${payload.cin}\n`);
+      void runAoc4Job(job, { artifactDir })
+        .then(() => {
+          process.stdout.write(`[server] job ${jobId} completed — phase: ${job.phase}\n`);
+        })
+        .catch((e: unknown) => {
+          const msg = e instanceof Error ? e.message : String(e);
+          process.stderr.write(`[server] job ${jobId} THREW: ${msg}\n`);
+          try { setPhase(jobId, 'FAILED', { error: msg }); } catch { /* job may already be gone */ }
+        });
 
       return send(res, 202, { job_id: jobId, phase: job.phase, createdAt: nowIso() });
     }

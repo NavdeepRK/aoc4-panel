@@ -67,7 +67,7 @@ const PANEL_SAVE_IDS: Record<string, string | null> = {
 
 export async function runAoc4Job(job: Aoc4Job, opts: { artifactDir: string; skipPanels2to6?: boolean }): Promise<void> {
   const { jobId, payload } = job;
-  const log = (msg: string) => process.stderr.write(`[aoc4-worker ${jobId}] ${msg}\n`);
+  const log = (msg: string) => process.stdout.write(`[aoc4-worker ${jobId}] ${msg}\n`);
 
   setPhase(jobId, 'LOGGING_IN');
   // Honors HEADLESS env var. For CI/automated runs set HEADLESS=true.
@@ -85,7 +85,62 @@ export async function runAoc4Job(job: Aoc4Job, opts: { artifactDir: string; skip
 
   setPhase(jobId, 'LOADING_FORM');
   await page.goto(AOC4_FORM_URL, { waitUntil: 'domcontentloaded', timeout: 45_000 });
-  await waitForBridge(page, 30_000);
+
+  // ── Session check ─────────────────────────────────────────────────────────────
+  // If storage-state.json is missing or the MCA session has expired, the server
+  // issues a 302 → login page before any JS runs. Detect this early so we get a
+  // clear FAILED message instead of a cryptic waitForBridge timeout 30 s later.
+  {
+    const currentUrl = page.url();
+    const isLoginPage =
+      currentUrl.includes('fologin') ||
+      currentUrl.includes('/login') ||
+      currentUrl.includes('login.html');
+
+    if (!isLoginPage) {
+      // Even if the URL looks right, the page might be an auth-error/redirect
+      // intermediate. Give AEM 3 s to settle and re-check.
+      await page.waitForTimeout(3000);
+      const settledUrl = page.url();
+      if (
+        settledUrl.includes('fologin') ||
+        settledUrl.includes('/login') ||
+        settledUrl.includes('login.html')
+      ) {
+        await browser.close().catch(() => {});
+        setPhase(jobId, 'FAILED', {
+          error:
+            'MCA session expired or storage-state.json is missing. ' +
+            'Run `npm run login` in the mca-filing-service directory to create a fresh session, then retry.',
+        });
+        return;
+      }
+    } else {
+      await browser.close().catch(() => {});
+      setPhase(jobId, 'FAILED', {
+        error:
+          'MCA session expired or storage-state.json is missing. ' +
+          'Run `npm run login` in the mca-filing-service directory to create a fresh session, then retry.',
+      });
+      return;
+    }
+  }
+  log('session OK — form URL loaded');
+
+  // waitForBridge with a descriptive error on timeout (e.g. session expired mid-load)
+  await waitForBridge(page, 30_000).catch(async (e: unknown) => {
+    const currentUrl = page.url();
+    const onLogin =
+      currentUrl.includes('fologin') ||
+      currentUrl.includes('/login') ||
+      currentUrl.includes('login.html');
+    await browser.close().catch(() => {});
+    const hint = onLogin
+      ? 'Redirected to login page — session expired. Run `npm run login` and retry.'
+      : `guideBridge did not load within 30 s (URL: ${currentUrl}). The form may have changed.`;
+    throw Object.assign(new Error(hint), { cause: e });
+  });
+
   await page.waitForFunction(
     () => typeof (window as unknown as { encrypt?: unknown }).encrypt === 'function' && !!document.querySelector('#csrfToken'),
     { timeout: 30_000 },
@@ -153,16 +208,39 @@ export async function runAoc4Job(job: Aoc4Job, opts: { artifactDir: string; skip
   await page.waitForTimeout(800);
   log('panel1 filled + signatory tables populated');
 
-  // Surface visible panel-1 errors (diagnostic).
-  const preCheck = await capturePanel1Errors(page);
-  if (preCheck.errorCount > 0) {
-    fs.writeFileSync(path.join(opts.artifactDir, `${jobId}-panel1-errors.json`), JSON.stringify(preCheck, null, 2));
-    log(`WARNING: panel1 has ${preCheck.errorCount} visible error(s); continuing with bypass`);
-  } else {
-    log('panel1 validation clean (visible markers)');
-  }
+  // ── Pre-save panel 1 validation check ───────────────────────────────────────
+  // Trigger AEM's own per-field blur validation so errors appear in the DOM
+  // before we inspect, then check for visible error markers.
+  await page.evaluate(() => {
+    // Fire blur on every visible input/select so AEM's field-level validators run
+    document.querySelectorAll<HTMLElement>(
+      '[id*="panel1AOC4"] input, [id*="panel1AOC4"] select, [id*="panel1AOC4"] textarea'
+    ).forEach(el => {
+      if ((el as HTMLElement).offsetParent !== null) {
+        el.dispatchEvent(new Event('blur', { bubbles: true }));
+        el.dispatchEvent(new Event('change', { bubbles: true }));
+      }
+    });
+  });
+  await page.waitForTimeout(600);
 
-  // Bypass gb.validate so the save click fires
+  const preCheck = await capturePanel1Errors(page);
+  fs.writeFileSync(path.join(opts.artifactDir, `${jobId}-panel1-errors.json`), JSON.stringify(preCheck, null, 2));
+
+  if (preCheck.errorCount > 0) {
+    const errSummary = preCheck.samples.map(s => s.msg).join(' | ');
+    log(`panel1 has ${preCheck.errorCount} validation error(s): ${errSummary}`);
+    setPhase(jobId, 'FAILED', {
+      error: `Panel 1 validation failed (${preCheck.errorCount} error${preCheck.errorCount > 1 ? 's' : ''}): ${errSummary.slice(0, 300)}`,
+    });
+    return;
+  }
+  log('panel1 validation clean — proceeding to save');
+
+  // Bypass gb.validate so the save click fires despite panels 2-7 being empty.
+  // (AEM's GLOBAL gb.validate() fails if any other panel has unfilled mandatory fields,
+  //  silently swallowing the click without firing /bin/commonSaveSubmit. We've already
+  //  confirmed panel 1 itself is clean above, so bypassing here is safe.)
   await page.evaluate(() => {
     type GBOverride = { validate?: () => boolean; _origValidate?: () => boolean };
     const gb = (window as unknown as { guideBridge: GBOverride }).guideBridge;
@@ -194,6 +272,15 @@ export async function runAoc4Job(job: Aoc4Job, opts: { artifactDir: string; skip
   let aemDraftId: string | undefined;
   let aemResp: Awaited<ReturnType<typeof page.waitForResponse>> | null = null;
 
+  // If no XHR fired at all, panel 1 save silently failed — check DOM for errors
+  if (!siebelResp) {
+    const postSaveErrors = await capturePanel1Errors(page);
+    const errSummary = postSaveErrors.samples.map(s => s.msg).join(' | ') || 'Save button click did not reach MCA server (validate blocked or network error)';
+    log(`panel1 save XHR never fired. DOM errors: ${errSummary}`);
+    setPhase(jobId, 'FAILED', { error: `Panel 1 save failed: ${errSummary.slice(0, 300)}` });
+    return;
+  }
+
   // referenceNumber from a CLEAN save (e.g. "1-25383887613") — this is what shows in MCA's
   // "My Application" SRN column. Distinguished from the integrationId / SR id which is
   // shorter (e.g. "1-BNSWT19") and used internally.
@@ -212,7 +299,16 @@ export async function runAoc4Job(job: Aoc4Job, opts: { artifactDir: string; skip
         if (inner.data?.integrationId) srId = inner.data.integrationId;
         if (inner.data?.referenceNumber) referenceNumber = inner.data.referenceNumber;
         const status = inner.data?.SRFOStatus ?? '';
-        log(`Siebel save: status=${siebelResp.status()}, srId=${srId ?? '-'}, ref=${referenceNumber ?? '-'}, mcaStatus=${status}, msg=${(inner.message ?? '').slice(0, 100)}`);
+        // Detect server-side validation errors in the Siebel response
+        const msg = inner.message ?? '';
+        const isServerError = siebelResp.status() >= 400 ||
+          (msg.length > 0 && !inner.data?.integrationId && !m);
+        if (isServerError) {
+          log(`panel1 Siebel save returned error: ${msg.slice(0, 200)}`);
+          setPhase(jobId, 'FAILED', { error: `Panel 1 save rejected by MCA: ${msg.slice(0, 300) || `HTTP ${siebelResp.status()}`}` });
+          return;
+        }
+        log(`Siebel save: status=${siebelResp.status()}, srId=${srId ?? '-'}, ref=${referenceNumber ?? '-'}, mcaStatus=${status}, msg=${msg.slice(0, 100)}`);
       } else {
         log(`Siebel save: status=${siebelResp.status()}, no resStr — body: ${text.slice(0, 200)}`);
       }
@@ -289,7 +385,10 @@ export async function runAoc4Job(job: Aoc4Job, opts: { artifactDir: string; skip
   // Mark aemResp as not-set since we no longer use the promise variant
   void aemResp;
 
-  job.panelResults.push({ panel: 1, ok: !!siebelResp && siebelResp.status() < 400, srId });
+  // Panel 1 is filled via explicit field writes (not generic fill), so we don't have
+  // a fillStats count. Use a sentinel value (-1) to mean "filled by automation logic"
+  // so the UI can distinguish it from panels that were genuinely empty (0).
+  job.panelResults.push({ panel: 1, ok: !!siebelResp && siebelResp.status() < 400, srId, fieldsWritten: -1 });
   if (srId) job.srId = srId;
   if (referenceNumber) job.referenceNumber = referenceNumber;
 
@@ -382,6 +481,7 @@ export async function runAoc4Job(job: Aoc4Job, opts: { artifactDir: string; skip
 
       // Generic fill — fills every visible empty leaf in the panel
       const fillStats = await _applyGenericPanelFill(page, panelKey, payload);
+      const fieldsWritten = fillStats.numericCount + fillStats.radioCount + fillStats.textCount + fillStats.dateCount;
       log(`panel${panelNum} filled ${fillStats.numericCount}n / ${fillStats.radioCount}r / ${fillStats.textCount}t / ${fillStats.dateCount}d`);
 
       // Auditor-specific fields (panel 2)
@@ -399,11 +499,11 @@ export async function runAoc4Job(job: Aoc4Job, opts: { artifactDir: string; skip
       if (PANEL_SAVE_IDS[panelKey]) {
         await _reapplyValidateOverride(page);
         const r = await _clickPanelSaveAndCapture(page, panelKey);
-        job.panelResults.push({ panel: panelNum, ok: r.ok, srId: r.srId, error: r.error });
+        job.panelResults.push({ panel: panelNum, ok: r.ok, srId: r.srId, error: r.error, fieldsWritten });
         fs.writeFileSync(path.join(opts.artifactDir, `${jobId}-panel${panelNum}.json`), JSON.stringify(r, null, 2));
         log(`panel${panelNum} save ok=${r.ok} srId=${r.srId ?? '-'}`);
       } else {
-        job.panelResults.push({ panel: panelNum, ok: true });
+        job.panelResults.push({ panel: panelNum, ok: true, fieldsWritten });
         log(`panel${panelNum} no Save button (rolls into next panel's save)`);
       }
 
@@ -963,13 +1063,6 @@ async function applyPanel1(page: import('playwright').Page, payload: import('./j
     };
     // ISO yyyy-MM-dd → DD/MM/YYYY converter for date fields whose AEM widget rejects
     // the ISO model format and only accepts the user-typed DD/MM/YYYY display format.
-    // Discovered live 2026-05-04: ifyesDateOfAGM and dueDateOfAGM rejected ISO with
-    // "Please enter a valid date" while other date fields (DateOfBoard, dateOfSigningOfReports,
-    // textbox1643785189026, fromDate, toDate) accept ISO fine.
-    const toDDMMYYYY = (iso: string): string => {
-      const m = iso.match(/^(\d{4})-(\d{2})-(\d{2})$/);
-      return m ? `${m[3]}/${m[2]}/${m[1]}` : iso;
-    };
     apply('fromDate', p.financialYearFrom);
     apply('toDate', p.financialYearTo);
     apply('textbox1643785189026', p.boardMeetingFsApprovalDate);
@@ -978,11 +1071,12 @@ async function applyPanel1(page: import('playwright').Page, payload: import('./j
     apply('natureS', 'Adopted Financial statements');
     apply('wetherProFinancialStatement', '1');
     apply('whetherAdoptedAdjAGM', '1');
-    apply('whetherAnnualGeneralMeeting', '0');
+    // '1' = AGM was held (agmDate present), '0' = not held
+    apply('whetherAnnualGeneralMeeting', p.agmDate ? '1' : '0');
     apply('whetherAnyExtension', '1');
-    // AGM date fields specifically need DD/MM/YYYY format — do NOT pass ISO
-    apply('ifyesDateOfAGM', toDDMMYYYY(p.agmDate));
-    apply('dueDateOfAGM', toDDMMYYYY(p.agmDueDate));
+    // guideDatePicker model value must be ISO (YYYY-MM-DD) — setProperty writes the XFA model
+    apply('ifyesDateOfAGM', p.agmDate);
+    apply('dueDateOfAGM', p.agmDueDate);
     apply('numberOfMembers', String(p.numberOfMembers));
   }, payload);
 }

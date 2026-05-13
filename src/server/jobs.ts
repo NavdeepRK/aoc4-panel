@@ -130,7 +130,14 @@ export interface Aoc4Job {
   /** Path where the admin-uploaded signed PDF is staged. */
   signedPdfPath?: string;
   /** Per-panel save outcomes for diagnostics */
-  panelResults: Array<{ panel: number; ok: boolean; srId?: string; error?: string }>;
+  panelResults: Array<{
+    panel: number;
+    ok: boolean;
+    srId?: string;
+    error?: string;
+    /** Number of fields actually written during generic fill (0 = panel was force-saved empty) */
+    fieldsWritten?: number;
+  }>;
   /** Internal: current panel being processed (for monitoring only) */
   panelInProgress?: number;
   /** Internal: live browser handle. Kept alive across HTTP requests. */
