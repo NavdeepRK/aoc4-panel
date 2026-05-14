@@ -13,7 +13,67 @@
  * and assumes the worker has the in-memory state).
  */
 
+import * as fs from 'node:fs';
+import * as path from 'node:path';
 import type { Browser, Page } from 'playwright';
+
+/**
+ * On-disk job state cache.
+ *
+ * Why: an in-memory-only design loses everything when the service restarts —
+ * status queries 404, downloaded PDFs become orphaned, the SPOC has to re-trigger
+ * from scratch even when MCA already has a valid draft. So we snapshot the
+ * serializable fields after every phase transition.
+ *
+ * What we DON'T persist: `_browser` and `_page` (Playwright handles can't be
+ * rehydrated across processes). Hydrated jobs are read-only for actions that
+ * need a live browser (upload-signed, PDF re-fetch). The status + saved-PDF
+ * endpoints still work.
+ */
+const STATE_ROOT = process.env.MCA_FILING_ARTIFACT_DIR ?? './.artifacts/runs';
+const STATE_FILE = 'state.json';
+
+function _stateFilePath(jobId: string): string {
+  return path.join(STATE_ROOT, jobId, STATE_FILE);
+}
+
+/** Strip browser handles + persist to disk. Best-effort — failures are logged but not thrown. */
+function _persistJob(job: Aoc4Job): void {
+  try {
+    const { _browser: _b, _page: _p, ...serializable } = job;
+    const dir = path.join(STATE_ROOT, job.jobId);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(_stateFilePath(job.jobId), JSON.stringify(serializable, null, 2), 'utf8');
+  } catch (e) {
+    process.stderr.write(`[jobs] persist failed for ${job.jobId}: ${(e as Error).message}\n`);
+  }
+}
+
+/** Read state.json files from disk on service startup, populating the in-memory map. */
+export function hydrateJobsFromDisk(): { hydrated: number; skipped: number } {
+  let hydrated = 0;
+  let skipped = 0;
+  try {
+    if (!fs.existsSync(STATE_ROOT)) return { hydrated: 0, skipped: 0 };
+    for (const name of fs.readdirSync(STATE_ROOT)) {
+      const stateFile = _stateFilePath(name);
+      if (!fs.existsSync(stateFile)) { skipped++; continue; }
+      try {
+        const raw = fs.readFileSync(stateFile, 'utf8');
+        const parsed = JSON.parse(raw) as Aoc4Job;
+        // Browser handles are gone — anything that needs them will fail with a clear error.
+        // Other surfaces (status, PDF download from disk) work fine.
+        jobs.set(parsed.jobId, parsed);
+        hydrated++;
+      } catch {
+        skipped++;
+      }
+    }
+  } catch (e) {
+    process.stderr.write(`[jobs] hydrate failed: ${(e as Error).message}\n`);
+  }
+  return { hydrated, skipped };
+}
 
 export type Aoc4Phase =
   | 'PENDING'             // job created, browser not yet launched
@@ -69,21 +129,33 @@ export interface Aoc4FormPayload {
     longTermBorrowings?: { current: number; previous?: number };
     shortTermBorrowings?: { current: number; previous?: number };
     tradePayables?: { current: number; previous?: number };
+    otherCurrentLiabilities?: { current: number; previous?: number };
+    shortTermProvisions?: { current: number; previous?: number };
     /** Assets */
+    fixedAssets?: { current: number; previous?: number };        // row 16 — PPE
     propertyPlantEquipment?: { current: number; previous?: number };
     intangibleAssets?: { current: number; previous?: number };
     investments?: { current: number; previous?: number };
+    longTermLoansAndAdvances?: { current: number; previous?: number };
     inventories?: { current: number; previous?: number };
     tradeReceivables?: { current: number; previous?: number };
     cashAndCashEquivalents?: { current: number; previous?: number };
+    shortTermLoansAndAdvances?: { current: number; previous?: number };
+    otherCurrentAssets?: { current: number; previous?: number };
   };
-  /** Profit & Loss summary (panel 4) */
+  /** Profit & Loss summary (panel 6 in the live form) */
   profitAndLoss?: {
     revenueFromOperations?: { current: number; previous?: number };
     otherIncome?: { current: number; previous?: number };
     totalRevenue?: { current: number; previous?: number };
+    costOfMaterialsConsumed?: { current: number; previous?: number };
+    employeeBenefitExpense?: { current: number; previous?: number };
+    financeCharges?: { current: number; previous?: number };
+    depreciationAndAmortisation?: { current: number; previous?: number };
+    otherExpenses?: { current: number; previous?: number };
     totalExpenses?: { current: number; previous?: number };
     profitBeforeTax?: { current: number; previous?: number };
+    taxExpense?: { current: number; previous?: number };
     profitAfterTax?: { current: number; previous?: number };
   };
   /**
@@ -159,6 +231,7 @@ export function createJob(jobId: string, payload: Aoc4FormPayload): Aoc4Job {
     panelResults: [],
   };
   jobs.set(jobId, job);
+  _persistJob(job);
   return job;
 }
 
@@ -172,6 +245,7 @@ export function setPhase(jobId: string, phase: Aoc4Phase, extra?: Partial<Aoc4Jo
   j.phase = phase;
   j.lastEventAt = Date.now();
   if (extra) Object.assign(j, extra);
+  _persistJob(j); // snapshot every phase transition so the service can be restarted safely
   return j;
 }
 

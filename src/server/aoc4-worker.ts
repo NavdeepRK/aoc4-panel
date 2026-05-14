@@ -409,9 +409,22 @@ export async function runAoc4Job(job: Aoc4Job, opts: { artifactDir: string; skip
     log(`resume URL: ${job.resumeUrl}`);
   }
 
-  // Wait briefly for any post-save UI (modal, transition). Don't dismiss programmatically;
-  // we want AEM's natural flow to settle.
-  await page.waitForTimeout(2500);
+  // Wait briefly for the post-save modal to render, then DISMISS IT.
+  // After panel 1 saves MCA shows an "OK" confirmation modal. The form WON'T transition
+  // to panel 2 until the modal is dismissed — panel 2's save button stays disabled, and
+  // gb.resolveNode('panel2AOC4') returns a node with uninitialized fields (no `value` props).
+  // Earlier code left this modal open ("don't dismiss programmatically") which caused
+  // panels 2-6 to fill 0 fields. Dismissing here is required for the wizard to advance.
+  await page.waitForTimeout(2000);
+  const panel1ModalDismissed = await _dismissPostSaveModal(page);
+  if (panel1ModalDismissed) {
+    log('panel1 post-save modal dismissed — form should now navigate to panel 2');
+    // Give AEM a moment to render panel 2's fields into the guideBridge model
+    await page.waitForTimeout(2000);
+  } else {
+    log('panel1 post-save modal not found — form may have auto-advanced or modal uses different selector');
+    await page.waitForTimeout(1000);
+  }
 
   // Capture final state — does the bridge now report a draftID?
   const finalState = await page.evaluate(() => {
@@ -459,11 +472,21 @@ export async function runAoc4Job(job: Aoc4Job, opts: { artifactDir: string; skip
       // Filling a non-active panel is a no-op (the bridge fields aren't visible/writable).
       // Discovered live 2026-05-04 — earlier code filled too eagerly and saw `0n / 0r / 0t / 0d`
       // for every downstream panel.
+      // Root cause (2026-05-13): the post-save modal from the PREVIOUS panel must be dismissed
+      // before the CURRENT panel's save button enables. The form won't navigate forward while
+      // a modal is open. We now dismiss the previous panel's modal right after its save, but
+      // as a belt-and-suspenders check we also try dismissal here, before the button poll.
+      const dismissedBeforePoll = await _dismissPostSaveModal(page);
+      if (dismissedBeforePoll) {
+        log(`panel${panelNum} found lingering modal before button poll — dismissed`);
+        await page.waitForTimeout(1500);
+      }
+
       const buttonId = PANEL_SAVE_IDS[panelKey];
       if (buttonId) {
         const enabled = await page.evaluate(async (id: string) => {
           const start = Date.now();
-          while (Date.now() - start < 12_000) {
+          while (Date.now() - start < 20_000) {
             const el = document.getElementById(id) as HTMLButtonElement | null;
             if (el && !el.disabled && el.getAttribute('aria-disabled') !== 'true' && el.offsetParent !== null) return true;
             await new Promise((r) => setTimeout(r, 500));
@@ -473,11 +496,29 @@ export async function runAoc4Job(job: Aoc4Job, opts: { artifactDir: string; skip
         if (!enabled) {
           // Fallback to force-enable so the loop continues — we may save with empty data
           // but that's better than hanging on every panel.
-          log(`panel${panelNum} save button did not enable within 12s — force-enabling`);
+          log(`panel${panelNum} save button did not enable within 20s — force-enabling`);
         } else {
-          log(`panel${panelNum} save button now active — fields should be reachable`);
+          log(`panel${panelNum} save button now active — filling`);
         }
       }
+
+      // Diagnostic: probe the guideBridge node for this panel before filling
+      const panelDiag = await page.evaluate((pk: string) => {
+        type GuideNode = { name?: string; somExpression?: string; items?: GuideNode[]; value?: unknown; visible?: boolean; className?: string };
+        const gb = (window as unknown as { guideBridge: { resolveNode: (s: string) => unknown; customContextProperty?: (k: string) => unknown } }).guideBridge;
+        const node = gb.resolveNode(pk) as GuideNode | null;
+        if (!node) return { nodeExists: false, itemCount: 0, leafCount: 0, currentIndex: -1, visibleItemCount: 0 };
+        let leafCount = 0; let visibleItemCount = 0;
+        const count = (n: GuideNode): void => {
+          if (n.somExpression && 'value' in n) leafCount++;
+          if (n.visible !== false) visibleItemCount++;
+          if (Array.isArray(n.items)) for (const c of n.items) count(c);
+        };
+        count(node);
+        const currentIndex = (gb as unknown as { currentIndex?: number }).currentIndex ?? -1;
+        return { nodeExists: true, itemCount: node.items?.length ?? 0, leafCount, visibleItemCount, nodeVisible: node.visible, currentIndex };
+      }, panelKey);
+      log(`panel${panelNum} diag: nodeExists=${panelDiag.nodeExists} items=${panelDiag.itemCount} leafs=${panelDiag.leafCount} visibleItems=${panelDiag.visibleItemCount} nodeVisible=${panelDiag.nodeVisible} gbIdx=${panelDiag.currentIndex}`);
 
       // Generic fill — also captures field metadata for smart overrides + artifacts
       const fillStats = await _applyGenericPanelFill(page, panelKey, payload);
@@ -502,9 +543,10 @@ export async function runAoc4Job(job: Aoc4Job, opts: { artifactDir: string; skip
       }
 
       // P&L (panel 4)
-      if (panelKey === 'panel4AOC4' && payload.profitAndLoss) {
-        const applied = await _applyPanel4Overrides(page, payload, fillStats.fields);
-        log(`panel4 profitAndLoss applied ${applied} field overrides`);
+      // Panel 6 — P&L (discovered: P&L is in panel 6, panel 4 is additional disclosures)
+      if (panelKey === 'panel6AOC4' && payload.profitAndLoss) {
+        const applied = await _applyPanel6Overrides(page, payload);
+        log(`panel6 profitAndLoss applied ${applied} field overrides`);
       }
 
       // Caller-supplied direct field-name overrides (highest precedence)
@@ -719,12 +761,17 @@ async function _applyGenericPanelFill(
 
     const walk = (n: GuideNode | undefined): void => {
       if (!n) return;
-      // Skip whole subtree if not visible
-      if (n.visible === false) return;
+      // NOTE: We intentionally do NOT skip visible:false nodes here.
+      // AEM marks the ENTIRE subtree of inactive panels as visible:false, so
+      // checking visibility would zero-out panels 2-6 completely. gb.setProperty
+      // writes to the data model directly and works on hidden fields — the model
+      // value is what gets submitted, not the DOM state.
       const cls = n.className ?? '';
 
-      // Leaf — has value + somExpression
-      if (n.somExpression && Object.prototype.hasOwnProperty.call(n, 'value')) {
+      // Leaf — has somExpression and a 'value' property (own or prototype getter).
+      // AEM guide nodes often define 'value' as a prototype accessor, so hasOwnProperty
+      // would miss them entirely. Use 'in' operator which traverses the prototype chain.
+      if (n.somExpression && 'value' in n) {
         const cur = n.value;
         const empty = cur == null || cur === '';
         let wrote: string | null = null;
@@ -803,6 +850,11 @@ async function _applyPanel2Overrides(
     set('incomeTaxOfAuditor', aud.pan);
     set('membershipNumberOfAuditor', aud.membershipNumber);
     set('nameOfTheAuditor', aud.name);
+    // categoryOfAuditor: '1'=Individual, '2'=Firm  (discovered from AEM options)
+    if (aud.category) {
+      const catVal = aud.category.toLowerCase().includes('firm') ? '2' : '1'; // default Individual
+      set('categoryOfAuditor', catVal);
+    }
     if (aud.address) {
       set('addressLine1_Auditor', aud.address.line1);
       set('addressLine2_Auditor', aud.address.line2);
@@ -819,105 +871,151 @@ async function _applyPanel2Overrides(
 }
 
 /**
- * Panel 3 — Schedule III balance sheet. Applies payload.scheduleIII values
- * using keyword-based matching against the panel's actual field names.
- * The panel uses rows with Current/Previous year columns; we match by:
- *   1. Exact field name match from known-name table (fastest)
- *   2. Substring/keyword match (fallback)
- *   3. Position-based match for row-indexed patterns like FiguresAtEndOfCurrentReporting{N}
+ * Panel 3 — Schedule III balance sheet.
+ *
+ * AEM field name discovery (2026-05-13): balance sheet rows use a numbered pattern:
+ *   FiguresAtEndOfCurrentReporting{N}  / figuresAsEndOfPreviousReporting{N}
+ * where N maps to a fixed Schedule III line item. Keyword matching fails here because
+ * the field names contain no financial term — we use a direct index map instead.
+ *
+ * Row → Schedule III line item (Companies Act Schedule III, Part I):
+ *   1  → (a) Share capital
+ *   2  → (b) Reserves and surplus
+ *   6  → (a) Long term borrowings
+ *   10 → (a) Short term borrowings
+ *   11 → (b) Trade payables    (sub: outstandingDuesOfMicroEnterprises* + outstandingDuesOfOther*)
+ *   12 → (c) Other current liabilities
+ *   13 → (d) Short term provisions
+ *   16 → (i) Property Plant and Equipment
+ *   17 → (ii) Intangible assets
+ *   22 → (d) Long term loans and advances
+ *   25 → (b) Inventories
+ *   27 → (d) Cash and cash equivalents
+ *   28 → (e) Short term loans and advances
+ *   29 → (f) Other current assets
  */
 async function _applyPanel3Overrides(
   page: import('playwright').Page,
   payload: import('./jobs.js').Aoc4FormPayload,
-  fields: Array<{name: string; som: string; cls: string}>,
+  _fields: Array<{name: string; som: string; cls: string}>,
 ): Promise<number> {
   if (!payload.scheduleIII) return 0;
-  const sched = payload.scheduleIII;
+  const s = payload.scheduleIII;
 
-  // Map: fieldNameKeyword → {current, previous}
-  // Keywords are lowercase substrings to match against actual AEM field names.
-  // The AOC-4 Schedule III order (Part I: Equity & Liabilities, Part II: Assets)
-  // is standardised by the Companies Act, so position-based fill is a reliable fallback.
-  const kwMap: Array<{ keys: string[]; data: { current?: number; previous?: number } | undefined }> = [
-    { keys: ['equityshare', 'sharecapital', 'paidupcapital'], data: sched.equityShareCapital },
-    { keys: ['otherequity', 'reserve', 'surplus'],            data: sched.otherEquity },
-    { keys: ['longtermborr', 'longtermloans'],                data: sched.longTermBorrowings },
-    { keys: ['shorttermborr', 'shorttermloans'],              data: sched.shortTermBorrowings },
-    { keys: ['tradepay', 'accountspayable'],                  data: sched.tradePayables },
-    { keys: ['ppe', 'propertypla', 'tangibleasset', 'fixedasset'], data: sched.propertyPlantEquipment },
-    { keys: ['intangiblasset', 'intangible'],                 data: sched.intangibleAssets },
-    { keys: ['investment'],                                   data: sched.investments },
-    { keys: ['inventor'],                                     data: sched.inventories },
-    { keys: ['tradereceivable', 'accountsreceiv', 'debtors'], data: sched.tradeReceivables },
-    { keys: ['cashequival', 'cashandbank', 'cashandcash'],   data: sched.cashAndCashEquivalents },
+  // Direct (rowIndex → {current, previous}) mapping — no keyword guessing
+  type Entry = { row: number; cur?: number; prev?: number };
+  const rows: Entry[] = [
+    { row: 1,  cur: s.equityShareCapital?.current,         prev: s.equityShareCapital?.previous },
+    { row: 2,  cur: s.otherEquity?.current,                prev: s.otherEquity?.previous },
+    { row: 6,  cur: s.longTermBorrowings?.current,         prev: s.longTermBorrowings?.previous },
+    { row: 10, cur: s.shortTermBorrowings?.current,        prev: s.shortTermBorrowings?.previous },
+    { row: 12, cur: s.otherCurrentLiabilities?.current,    prev: s.otherCurrentLiabilities?.previous },
+    { row: 13, cur: s.shortTermProvisions?.current,        prev: s.shortTermProvisions?.previous },
+    { row: 16, cur: s.fixedAssets?.current,                prev: s.fixedAssets?.previous },
+    { row: 22, cur: s.longTermLoansAndAdvances?.current,   prev: s.longTermLoansAndAdvances?.previous },
+    { row: 25, cur: s.inventories?.current,                prev: s.inventories?.previous },
+    { row: 27, cur: s.cashAndCashEquivalents?.current,     prev: s.cashAndCashEquivalents?.previous },
+    { row: 28, cur: s.shortTermLoansAndAdvances?.current,  prev: s.shortTermLoansAndAdvances?.previous },
+    { row: 29, cur: s.otherCurrentAssets?.current,         prev: s.otherCurrentAssets?.previous },
   ];
 
-  // Build sets of current- and previous-year SOM expressions for each logical field
-  const numericFields = fields.filter(f => /TextBox|NumericBox/i.test(f.cls));
-  const currentFields = numericFields.filter(f => /current|endofcurrent|FiguresAtEnd/i.test(f.name));
-  const previousFields = numericFields.filter(f => /previous|endofprevious|figuresAsEnd/i.test(f.name));
-
-  return await page.evaluate(({ kwMap: kw, currentFs, previousFs }) => {
-    const gb = (window as unknown as { guideBridge: { setProperty: (s: string[], p: string, v: unknown[]) => void } }).guideBridge;
-    const set = (som: string, v: number | undefined): boolean => {
+  return await page.evaluate((entries: Entry[]) => {
+    const gb = (window as unknown as { guideBridge: { resolveNode: (s: string) => unknown; setProperty: (s: string[], p: string, v: unknown[]) => void } }).guideBridge;
+    type GN = { name?: string; somExpression?: string; items?: GN[] };
+    const root = gb.resolveNode('rootPanel') as GN | null;
+    const somByName = new Map<string, string>();
+    const collect = (n: GN | undefined): void => {
+      if (!n) return;
+      if (n.name && n.somExpression) somByName.set(n.name, n.somExpression);
+      if (Array.isArray(n.items)) for (const c of n.items) collect(c);
+    };
+    collect(root ?? undefined);
+    const set = (name: string, v: number | undefined): boolean => {
       if (v == null) return false;
+      const som = somByName.get(name);
+      if (!som) return false;
       try { gb.setProperty([som], 'value', [String(v)]); return true; } catch { return false; }
     };
     let count = 0;
-    for (const entry of kw) {
-      if (!entry.data) continue;
-      // Find matching current-year field
-      const cField = currentFs.find(f => entry.keys.some(k => f.name.toLowerCase().includes(k)));
-      if (cField && entry.data.current != null) { if (set(cField.som, entry.data.current)) count++; }
-      // Find matching previous-year field
-      const pField = previousFs.find(f => entry.keys.some(k => f.name.toLowerCase().includes(k)));
-      if (pField && entry.data.previous != null) { if (set(pField.som, entry.data.previous)) count++; }
+    for (const e of entries) {
+      if (set(`FiguresAtEndOfCurrentReporting${e.row}`, e.cur)) count++;
+      if (set(`figuresAsEndOfPreviousReporting${e.row}`, e.prev)) count++;
     }
     return count;
-  }, { kwMap, currentFs: currentFields, previousFs: previousFields });
+  }, rows);
 }
 
 /**
- * Panel 4 — Profit & Loss. Applies payload.profitAndLoss values using
- * keyword-based matching against the panel's actual field names.
+ * Panel 6 — Profit & Loss (Segment II).
+ *
+ * AEM field name discovery (2026-05-13): P&L fields are in panel 6 (not panel 4).
+ * All P&L items use the pattern revenueFromOperationsCurrentN where N maps to a
+ * specific line in the Schedule III Part II / Segment II:
+ *   10 → Total Income (I+II)                    — use for totalRevenue
+ *   11 → (a) Cost of materials consumed
+ *   16 → (d) Employee benefit expenses
+ *   21 → (i) Finance costs
+ *   22 → (j) Depreciation and amortization
+ *   23 → (k) Other expenses
+ *   24 → Total expenses
+ *   25 → Profit before exceptional items and tax
+ *   29 → Profit before tax
+ *   32 → Profit/(Loss) from continuing operations — use for profitAfterTax
+ *   36 → Profit/(Loss) (XI+XIV)                  — final PAT line
+ *
+ * Previous-year versions have a parallel set (captured via revenueFromOperationsPrevious{N}
+ * or similar — validate against actual artifact if needed).
  */
-async function _applyPanel4Overrides(
+async function _applyPanel6Overrides(
   page: import('playwright').Page,
   payload: import('./jobs.js').Aoc4FormPayload,
-  fields: Array<{name: string; som: string; cls: string}>,
 ): Promise<number> {
   if (!payload.profitAndLoss) return 0;
   const pnl = payload.profitAndLoss;
 
-  const kwMap: Array<{ keys: string[]; data: { current?: number; previous?: number } | undefined }> = [
-    { keys: ['revenuefromoper', 'salesrevenue', 'netsales'],    data: pnl.revenueFromOperations },
-    { keys: ['otherincome', 'miscrevenue'],                     data: pnl.otherIncome },
-    { keys: ['totalrevenue', 'grossrevenue'],                   data: pnl.totalRevenue },
-    { keys: ['totalexpense', 'totalcost'],                      data: pnl.totalExpenses },
-    { keys: ['profitbeforetax', 'pbt', 'earningsbefore'],       data: pnl.profitBeforeTax },
-    { keys: ['profitaftertax', 'pat', 'netprofit', 'profitfor'], data: pnl.profitAfterTax },
+  type PnlEntry = { name: string; cur?: number; prev?: number };
+  const entries: PnlEntry[] = [
+    // Revenue
+    { name: 'revenueFromOperationsCurrent10', cur: pnl.totalRevenue?.current,         prev: pnl.totalRevenue?.previous },
+    // Expenses
+    { name: 'revenueFromOperationsCurrent11', cur: pnl.costOfMaterialsConsumed?.current, prev: pnl.costOfMaterialsConsumed?.previous },
+    { name: 'revenueFromOperationsCurrent16', cur: pnl.employeeBenefitExpense?.current,  prev: pnl.employeeBenefitExpense?.previous },
+    { name: 'revenueFromOperationsCurrent21', cur: pnl.financeCharges?.current,           prev: pnl.financeCharges?.previous },
+    { name: 'revenueFromOperationsCurrent22', cur: pnl.depreciationAndAmortisation?.current, prev: pnl.depreciationAndAmortisation?.previous },
+    { name: 'revenueFromOperationsCurrent23', cur: pnl.otherExpenses?.current,            prev: pnl.otherExpenses?.previous },
+    { name: 'revenueFromOperationsCurrent24', cur: pnl.totalExpenses?.current,            prev: pnl.totalExpenses?.previous },
+    // Profit lines
+    { name: 'revenueFromOperationsCurrent25', cur: pnl.profitBeforeTax?.current,          prev: pnl.profitBeforeTax?.previous },
+    { name: 'revenueFromOperationsCurrent29', cur: pnl.profitBeforeTax?.current,          prev: pnl.profitBeforeTax?.previous },
+    { name: 'revenueFromOperationsCurrent36', cur: pnl.profitAfterTax?.current,           prev: pnl.profitAfterTax?.previous },
   ];
 
-  const numericFields = fields.filter(f => /TextBox|NumericBox/i.test(f.cls));
-  const currentFields = numericFields.filter(f => /current|endofcurrent|FiguresAtEnd/i.test(f.name));
-  const previousFields = numericFields.filter(f => /previous|endofprevious|figuresAsEnd/i.test(f.name));
-
-  return await page.evaluate(({ kwMap: kw, currentFs, previousFs }) => {
-    const gb = (window as unknown as { guideBridge: { setProperty: (s: string[], p: string, v: unknown[]) => void } }).guideBridge;
-    const set = (som: string, v: number | undefined): boolean => {
+  return await page.evaluate((items: PnlEntry[]) => {
+    const gb = (window as unknown as { guideBridge: { resolveNode: (s: string) => unknown; setProperty: (s: string[], p: string, v: unknown[]) => void } }).guideBridge;
+    type GN = { name?: string; somExpression?: string; items?: GN[] };
+    const root = gb.resolveNode('rootPanel') as GN | null;
+    const somByName = new Map<string, string>();
+    const collect = (n: GN | undefined): void => {
+      if (!n) return;
+      if (n.name && n.somExpression) somByName.set(n.name, n.somExpression);
+      if (Array.isArray(n.items)) for (const c of n.items) collect(c);
+    };
+    collect(root ?? undefined);
+    const set = (name: string, v: number | undefined): boolean => {
       if (v == null) return false;
+      const som = somByName.get(name);
+      if (!som) return false;
       try { gb.setProperty([som], 'value', [String(v)]); return true; } catch { return false; }
     };
     let count = 0;
-    for (const entry of kw) {
-      if (!entry.data) continue;
-      const cField = currentFs.find(f => entry.keys.some(k => f.name.toLowerCase().includes(k)));
-      if (cField && entry.data.current != null) { if (set(cField.som, entry.data.current)) count++; }
-      const pField = previousFs.find(f => entry.keys.some(k => f.name.toLowerCase().includes(k)));
-      if (pField && entry.data.previous != null) { if (set(pField.som, entry.data.previous)) count++; }
+    for (const e of items) {
+      if (set(e.name, e.cur)) count++;
+      // Previous year: try revenueFromOperationsPreviousN pattern
+      const prevName = e.name.replace('Current', 'Previous');
+      if (set(prevName, e.prev)) count++;
     }
     return count;
-  }, { kwMap, currentFs: currentFields, previousFs: previousFields });
+  }, entries);
 }
 
 /**
@@ -936,7 +1034,10 @@ export async function uploadSignedPdfAndSubmit(
   signedPdf: Buffer,
 ): Promise<{ ok: boolean; srn?: string; error?: string; phase?: import('./jobs.js').Aoc4Phase }> {
   const page = job._page;
-  if (!page) return { ok: false, error: 'job has no live page — browser may have been disposed' };
+  if (!page) return {
+    ok: false,
+    error: 'Live browser session is gone (service was likely restarted). Re-trigger automation from the ⚡ button — the existing MCA draft will be picked up automatically.',
+  };
 
   setPhase(job.jobId, 'UPLOADING_SIGNED');
 
@@ -1095,6 +1196,75 @@ async function _applyDirectOverrides(
  *
  * We also try a backup endpoint pattern for portals where the standard one returns 404.
  */
+/**
+ * Download the draft PDF by opening a new browser tab and navigating to AEM's print-preview
+ * endpoint. Unlike fetch()-based approaches (which Akamai CDN blocks with 403), a full
+ * browser navigation carries the right User-Agent, Referrer, and cookie context.
+ *
+ * This is exported so the HTTP server can call it from the /force-download-pdf endpoint.
+ */
+export async function downloadDraftPdfViaTab(
+  job: import('./jobs.js').Aoc4Job,
+  outPath: string,
+): Promise<{ ok: boolean; bytes?: number; via?: string; error?: string }> {
+  const page = job._page;
+  if (!page) return {
+    ok: false,
+    error: 'Live browser session is gone (service was likely restarted). Re-trigger automation to refresh the browser, or open the draft directly on MCA via the resume URL.',
+  };
+
+  // Get the AEM draftID from the live guideBridge first
+  const draftID = await page.evaluate(() => {
+    type GBX = { customContextProperty?: (k: string) => unknown };
+    return (window as unknown as { guideBridge?: GBX }).guideBridge?.customContextProperty?.('draftID') as string | undefined;
+  }).catch(() => undefined);
+
+  const candidates: string[] = [];
+  if (draftID) {
+    candidates.push(
+      `/content/forms/af/mca-af-forms/aoc/aoc-4/jcr:content/guideContainer.fp.pdf.jsp/${encodeURIComponent(draftID)}`,
+      `/content/forms/af/mca-af-forms/aoc/aoc-4/jcr:content/guideContainer.fp.printpreview.jsp/${encodeURIComponent(draftID)}`,
+    );
+  }
+  if (job.srId) {
+    candidates.push(
+      `/content/forms/af/mca-af-forms/aoc/aoc-4/jcr:content/guideContainer.fp.pdf.jsp/${encodeURIComponent(job.srId)}_af`,
+      `/content/forms/af/mca-af-forms/aoc/aoc-4/jcr:content/guideContainer.fp.pdf.jsp/${encodeURIComponent(job.srId)}`,
+    );
+  }
+
+  const ctx = page.context();
+  const tab = await ctx.newPage();
+  try {
+    for (const path_ of candidates) {
+      const url = `https://www.mca.gov.in${path_}`;
+      try {
+        const resp = await tab.goto(url, { waitUntil: 'networkidle', timeout: 30_000 });
+        if (!resp || !resp.ok()) continue;
+        const body = await resp.body();
+        const header = body.subarray(0, 4).toString('ascii');
+        if (header === '%PDF') {
+          fs.writeFileSync(outPath, body);
+          return { ok: true, bytes: body.length, via: url };
+        }
+      } catch { /* try next */ }
+    }
+
+    // Fallback: use Playwright's built-in page.pdf() on the current form page — not the
+    // official MCA PDF, but a Chromium-rendered snapshot the DSC signer can review.
+    await tab.close();
+    const printPdf = await page.pdf({
+      format: 'A4',
+      printBackground: true,
+      margin: { top: '10mm', bottom: '10mm', left: '10mm', right: '10mm' },
+    });
+    fs.writeFileSync(outPath, printPdf);
+    return { ok: true, bytes: printPdf.length, via: 'page.pdf() — chromium render (MCA PDF endpoint unavailable)' };
+  } finally {
+    try { await tab.close(); } catch { /* already closed */ }
+  }
+}
+
 async function downloadDraftPdf(
   page: import('playwright').Page,
   _cin: string,

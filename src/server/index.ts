@@ -23,9 +23,10 @@ import * as http from 'node:http';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as crypto from 'node:crypto';
-import { createJob, getJob, publicView, setPhase, listJobs, type Aoc4FormPayload } from './jobs.js';
-import { runAoc4Job, uploadSignedPdfAndSubmit } from './aoc4-worker.js';
+import { createJob, getJob, publicView, setPhase, listJobs, hydrateJobsFromDisk, type Aoc4FormPayload } from './jobs.js';
+import { runAoc4Job, uploadSignedPdfAndSubmit, downloadDraftPdfViaTab } from './aoc4-worker.js';
 import { fetchCompanyInfoByCin, fetchPanByCin } from './company-lookup.js';
+import { startHeartbeat, stopHeartbeat, pingMca } from './session-heartbeat.js';
 
 const PORT = Number(process.env.MCA_FILING_PORT ?? 8090);
 const ARTIFACT_ROOT = process.env.MCA_FILING_ARTIFACT_DIR ?? './.artifacts/runs';
@@ -95,6 +96,75 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, { ok: true, service: 'mca-filing-service', time: nowIso() });
     }
 
+    // GET /check-session — verifies MCA login by making a real HTTP request with stored cookies.
+    // Does NOT launch a browser. Uses Node's built-in https to hit an MCA endpoint that returns
+    // 200 only for authenticated users (redirects to login page for anonymous requests).
+    if (pathname === '/check-session' && method === 'GET') {
+      const ssPath = './storage-state.json';
+      if (!fs.existsSync(ssPath)) {
+        return send(res, 200, { loggedIn: false, reason: 'storage-state.json not found — run: npm run login' });
+      }
+
+      let ss: { cookies?: Array<{ name: string; value: string; expires: number; domain: string; path: string }> };
+      try {
+        ss = JSON.parse(fs.readFileSync(ssPath, 'utf8'));
+      } catch (e) {
+        return send(res, 200, { loggedIn: false, reason: `storage-state.json parse error: ${(e as Error).message}` });
+      }
+
+      const now = Date.now() / 1000;
+      const mcaCookies = (ss.cookies ?? []).filter(c => c.domain?.includes('mca.gov.in'));
+      if (mcaCookies.length === 0) {
+        return send(res, 200, { loggedIn: false, reason: 'no MCA cookies in storage-state.json — run: npm run login' });
+      }
+
+      // Build cookie header string from stored cookies (skip expired ones)
+      const cookieHeader = mcaCookies
+        .filter(c => c.expires === -1 || c.expires > now)
+        .map(c => `${c.name}=${c.value}`)
+        .join('; ');
+
+      if (!cookieHeader) {
+        return send(res, 200, { loggedIn: false, reason: 'all MCA cookies expired — run: npm run login' });
+      }
+
+      // MCA's CDN (Akamai) returns 403 for raw HTTP requests to most endpoints — even
+      // valid sessions get 403 because the CDN requires browser-like navigation context.
+      // The reliable check is: do the session-specific auth cookies exist AND are they
+      // not expired? After npm run login, MCA sets sessionID + session-token-md5 with a
+      // ~4-hour TTL. If those exist and have > 5 minutes left, the session is valid.
+      const AUTH_COOKIE_NAMES = ['sessionID', 'session-token-md5'];
+      const authCookies = mcaCookies.filter(c => AUTH_COOKIE_NAMES.includes(c.name));
+      const validAuth = authCookies.filter(c => c.expires === -1 || c.expires > now + 300); // 5-min buffer
+      const expiredAuth = authCookies.filter(c => c.expires > 0 && c.expires <= now + 300);
+
+      const loggedIn = validAuth.length >= 2; // both auth cookies must be present + valid
+      const secondsLeft = validAuth.length > 0
+        ? Math.min(...validAuth.filter(c => c.expires > 0).map(c => c.expires - now))
+        : 0;
+      const minutesLeft = Math.floor(secondsLeft / 60);
+
+      return send(res, 200, {
+        loggedIn,
+        reason: loggedIn
+          ? `session valid — auth cookies expire in ~${minutesLeft} min (run: npm run login to refresh before they expire)`
+          : expiredAuth.length > 0
+            ? 'MCA session expired — run: npm run login to refresh'
+            : 'MCA auth cookies not found — run: npm run login first',
+        cookieCount: mcaCookies.length,
+        authCookiesFound: authCookies.length,
+        validAuthCookies: validAuth.length,
+        expiresInMinutes: minutesLeft > 0 ? minutesLeft : null,
+        note: 'checked sessionID + session-token-md5 cookie expiry (MCA CDN blocks raw HTTP probes)',
+      });
+    }
+
+    // GET /ping-session — fire a single manual heartbeat ping and return the result
+    if (pathname === '/ping-session' && method === 'GET') {
+      const result = await pingMca();
+      return send(res, 200, { ...result, time: nowIso() });
+    }
+
     // --- Public company-info lookup -------------------------------------------------
     // GET /company-info?cin=...  — returns full 61-field public profile
     // GET /company/:cin/pan      — returns just { pan, companyName } for the lightweight case
@@ -113,6 +183,43 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (pathname === '/start-aoc4' && method === 'POST') {
+      // ── Session pre-flight ──────────────────────────────────────────────
+      // Make a real HTTP request to MCA with the stored cookies to verify the session
+      // is actually valid — not just checking cookie timestamps which can lie.
+      {
+        const ssPath = './storage-state.json';
+        if (!fs.existsSync(ssPath)) {
+          return send(res, 401, { error: 'MCA session not found. Run `npm run login` first, then retry.' });
+        }
+        try {
+          const ss = JSON.parse(fs.readFileSync(ssPath, 'utf8')) as {
+            cookies?: Array<{ name: string; value: string; expires: number; domain: string }>;
+          };
+          const now = Date.now() / 1000;
+          const mcaCookies = (ss.cookies ?? []).filter(c => c.domain?.includes('mca.gov.in'));
+          if (mcaCookies.length === 0) {
+            return send(res, 401, { error: 'No MCA cookies found. Run `npm run login` first, then retry.' });
+          }
+          const cookieHeader = mcaCookies
+            .filter(c => c.expires === -1 || c.expires > now)
+            .map(c => `${c.name}=${c.value}`)
+            .join('; ');
+          if (!cookieHeader) {
+            return send(res, 401, { error: 'MCA session expired (all cookies past expiry). Run `npm run login` to refresh.' });
+          }
+          // Check that the two auth cookies (sessionID + session-token-md5) are present and
+          // have at least 5 minutes left. MCA CDN blocks raw HTTP probes so we can't do a
+          // live network check without a full browser.
+          const authNames = ['sessionID', 'session-token-md5'];
+          const validAuthCookies = mcaCookies.filter(c =>
+            authNames.includes(c.name) && (c.expires === -1 || c.expires > now + 300),
+          );
+          if (validAuthCookies.length < 2) {
+            return send(res, 401, { error: 'MCA session expired — run `npm run login` to refresh, then retry.' });
+          }
+        } catch { /* parse error — allow through, worker will surface it */ }
+      }
+
       const payload = await readJson<Aoc4FormPayload>(req);
       const err = validatePayload(payload);
       if (err) return send(res, 400, { error: err });
@@ -159,6 +266,26 @@ const server = http.createServer(async (req, res) => {
       });
       res.end(buf);
       return;
+    }
+
+    // POST /jobs/:jobId/force-download-pdf
+    // Re-attempts the PDF download using a real browser tab (bypasses Akamai CDN 403s).
+    // Use this when the automatic download at DRAFT_CREATED time failed.
+    m = pathname.match(/^\/jobs\/([^/]+)\/force-download-pdf$/);
+    if (m && method === 'POST') {
+      const job = getJob(m[1]);
+      if (!job) return send(res, 404, { error: 'job not found' });
+      if (!['DRAFT_CREATED', 'PDF_DOWNLOADED', 'AWAITING_SIGNATURE'].includes(job.phase)) {
+        return send(res, 400, { error: `cannot download PDF in phase ${job.phase} — job must be DRAFT_CREATED or later` });
+      }
+      const dir = path.join(ARTIFACT_ROOT, job.jobId);
+      fs.mkdirSync(dir, { recursive: true });
+      const pdfPath = path.join(dir, 'draft.pdf');
+      const result = await downloadDraftPdfViaTab(job, pdfPath);
+      if (!result.ok) return send(res, 502, { error: result.error });
+      job.draftPdfPath = pdfPath;
+      if (job.phase === 'DRAFT_CREATED') setPhase(job.jobId, 'PDF_DOWNLOADED');
+      return send(res, 200, { ok: true, bytes: result.bytes, via: result.via, phase: job.phase });
     }
 
     m = pathname.match(/^\/jobs\/([^/]+)\/upload-signed$/);
@@ -216,11 +343,20 @@ const server = http.createServer(async (req, res) => {
 
 server.listen(PORT, () => {
   process.stderr.write(`[mca-filing-service] listening on :${PORT} — artifacts → ${ARTIFACT_ROOT}\n`);
+  // Hydrate jobs persisted to disk from prior runs so /jobs/:id/status + /pdf keep working
+  // across restarts. Live actions (upload-signed, force-download-pdf) still require a browser
+  // and will fail with a clear "service was restarted" error if attempted on a stale job.
+  const { hydrated, skipped } = hydrateJobsFromDisk();
+  if (hydrated > 0 || skipped > 0) {
+    process.stderr.write(`[mca-filing-service] hydrated ${hydrated} job(s) from disk, skipped ${skipped}\n`);
+  }
+  startHeartbeat();
 });
 
 // Graceful shutdown so in-flight Playwright browsers get a chance to close
 const shutdown = async (sig: string): Promise<void> => {
   process.stderr.write(`[mca-filing-service] received ${sig}, draining…\n`);
+  stopHeartbeat();
   server.close();
   process.exit(0);
 };
