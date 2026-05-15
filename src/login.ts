@@ -60,20 +60,27 @@ export async function observe(page: Page): Promise<LoginObservation> {
     return { step: 'invalid-credentials', url, errorMessage: errorMsg.trim() };
   }
 
-  // Logged-in marker: URL is application-history.
+  // Logged-in markers, in priority order:
+  //   1. URL contains /application-history — original confident signal
+  //   2. URL outside the /foportal/fo*.html login routes AND both auth cookies set
+  //   3. Cookies-only fallback for SPA-style flows where URL stays at fologin.html
+  //      even after OTP submits successfully (observed live 2026-05-14: OTP succeeded,
+  //      auth cookies set, but URL never changed — old check timed out).
   //
-  // History: previous versions accepted "URL outside login flow" or "logout link visible"
-  // as logged-in markers — both produced false positives because the OTP-entered page
-  // transiently rendered nav links matching those patterns before MCA actually completed
-  // the redirect.
-  //
-  // We tried tightening to "URL=/application-history AND sessionID+session-token-md5
-  // cookies present" but MCA appears to have changed cookie names / not set those any
-  // more in some flows, leading to legitimate logins being rejected. The URL-only check
-  // is the most reliable signal we have today: if MCA redirected us to /application-history,
-  // the session is valid (whatever cookie shape it ends up with).
+  // The cookie-based check uses BOTH sessionID + session-token-md5 (the names MCA has
+  // been using consistently throughout 2025-2026). Both must be present AND have
+  // values — otherwise we'd false-positive on partial state during the OTP submit.
   const onApplicationHistory = url.includes('/application-history');
   if (onApplicationHistory) {
+    return { step: 'logged-in', url };
+  }
+
+  // Cookie-based fallback. page.context().cookies() is async; do it after the cheap URL
+  // check above so we don't fire it every poll when URL alone is conclusive.
+  const cookies = await page.context().cookies().catch(() => []);
+  const hasAuth = cookies.some(c => c.name === 'sessionID' && c.value)
+                && cookies.some(c => c.name === 'session-token-md5' && c.value);
+  if (hasAuth) {
     return { step: 'logged-in', url };
   }
 

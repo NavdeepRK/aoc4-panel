@@ -172,6 +172,36 @@ export interface Aoc4FormPayload {
   panelOverrides?: Partial<Record<'panel1' | 'panel2' | 'panel3' | 'panel4' | 'panel5' | 'panel6' | 'panel7', Record<string, string | number>>>;
   /** Whether to override gb.validate to bypass cross-panel validation. Default true (proven required for partial saves). */
   bypassValidation?: boolean;
+
+  /* ──────────────────────────────────────────────────────────────────────── */
+  /* Panel 1 radio / dropdown answers — match the AOC-4 form question numbers. */
+  /* All optional with sensible defaults for a typical small-Pvt filing; pass  */
+  /* explicit values from the PDF/SPOC form to override. Values are the EXACT  */
+  /* strings MCA's form expects (e.g. "Yes", not "1") — set live 2026-05-15.  */
+  /* ──────────────────────────────────────────────────────────────────────── */
+
+  /** 4(b)(i) Nature of financial statements. Default 'Adopted Financial statements'. */
+  natureOfFinancialStatements?: 'Provisional un-adopted Financial statements' | 'Adopted Financial statements' | 'Revised Financial statements u/s 130' | 'Revised Financial statements u/s 131';
+  /** 4(b)(iii) Whether provisional FS filed earlier. Default 'No'. */
+  provisionalFsFiledEarlier?: 'Yes' | 'No' | 'Not Applicable';
+  /** 4(b)(iv) Whether adopted in adjourned AGM. Default 'No'. */
+  adoptedInAdjournedAgm?: 'Yes' | 'No' | 'Not Applicable';
+  /** 7(a) Whether AGM held. Default 'Yes' if agmDate present, else 'No'. */
+  agmHeld?: 'Yes' | 'No' | 'Not Applicable';
+  /** 7(d) Whether any extension for AGM granted. Default 'No'. */
+  agmExtensionGranted?: 'Yes' | 'No';
+  /** 8(a) Whether the company is a subsidiary. Default 'No'. */
+  isSubsidiary?: 'Yes' | 'No';
+  /** 8(e) Whether the company HAS a subsidiary/associate/JV. Default 'No'. */
+  hasSubsidiaryOrAssociate?: 'Yes' | 'No';
+  /** 10(a) Type of Industry. Default 'Commercial & Industrial'. */
+  industryType?: 'Commercial & Industrial' | 'Banking Company' | 'Insurance Company' | 'Power Company' | 'Non-banking Financial Company';
+  /** 10(b) Whether Schedule III applicable. Default 'Yes'. MUST be 'Yes' when industryType is C&I/NBFC. */
+  scheduleIIIApplicable?: 'Yes' | 'No';
+  /** 11 Whether consolidated FS required. Default 'No'. */
+  consolidatedFsRequired?: 'Yes' | 'No';
+  /** 12(a) Whether books maintained electronically. Default 'No'. */
+  electronicBooks?: 'Yes' | 'No';
 }
 
 export interface Aoc4Job {

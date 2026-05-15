@@ -1377,15 +1377,46 @@ async function applyPanel1(page: import('playwright').Page, payload: import('./j
     apply('textbox1643785189026', p.boardMeetingFsApprovalDate);
     apply('DateOfBoard', p.boardMeetingReportDate);
     apply('dateOfSigningOfReports', p.auditorSigningDate);
-    apply('natureS', 'Adopted Financial statements');
-    apply('wetherProFinancialStatement', '1');
-    apply('whetherAdoptedAdjAGM', '1');
-    // '1' = AGM was held (agmDate present), '0' = not held
-    apply('whetherAnnualGeneralMeeting', p.agmDate ? '1' : '0');
-    apply('whetherAnyExtension', '1');
+
+    // Q4(b)(i) Nature of FS — defaults to 'Adopted Financial statements'
+    apply('natureS', p.natureOfFinancialStatements || 'Adopted Financial statements');
+    // Q4(b)(iii) provisional filed earlier — defaults 'No' (previous '1' was wrong; form expects literal 'Yes'/'No')
+    apply('wetherProFinancialStatement', p.provisionalFsFiledEarlier || 'No');
+    // Q4(b)(iv) adopted in adjourned AGM — defaults 'No'
+    apply('whetherAdoptedAdjAGM', p.adoptedInAdjournedAgm || 'No');
+
+    // Q7(a) AGM held — explicit if provided, else infer from agmDate (Yes if present, No otherwise).
+    // MCA form's radio uses literal labels 'Yes'/'No'/'Not Applicable' (NOT '1'/'0').
+    apply('whetherAnnualGeneralMeeting', p.agmHeld || (p.agmDate ? 'Yes' : 'No'));
     // guideDatePicker model value must be ISO (YYYY-MM-DD) — setProperty writes the XFA model
     apply('ifyesDateOfAGM', p.agmDate);
     apply('dueDateOfAGM', p.agmDueDate);
+    // Q7(d) extension granted — defaults 'No'
+    apply('whetherAnyExtension', p.agmExtensionGranted || 'No');
+
+    // Q8(a) is subsidiary — defaults 'No'
+    apply('WhetherCompanyIsSubsidiary', p.isSubsidiary || 'No');
+    // Q8(e) has subsidiary/associate/JV — defaults 'No'
+    apply('whetherCompanyHasSubsidiary', p.hasSubsidiaryOrAssociate || 'No');
+
+    // Q10(a) Industry type — defaults 'Commercial & Industrial'.
+    // The field name is uncertain across form versions; try multiple candidates.
+    const industry = p.industryType || 'Commercial & Industrial';
+    apply('typeOfIndustry', industry);
+    apply('industryType', industry);
+    apply('IndustryType', industry);
+
+    // Q10(b) Schedule III applicable — defaults 'Yes' (MANDATORY 'Yes' when industry is C&I/NBFC,
+    // otherwise the form errors with "No cannot be selected if C&I or NBFC selected").
+    apply('whetherSchedule3', p.scheduleIIIApplicable || 'Yes');
+
+    // Q11 Consolidated FS — defaults 'No'
+    apply('whetherConsolidated', p.consolidatedFsRequired || 'No');
+
+    // Q12(a) Electronic books — defaults 'No'
+    apply('whetherBooksOfAccount', p.electronicBooks || 'No');
+    apply('whetherCompanyIsMaintainingBooksOfAccount', p.electronicBooks || 'No');
+
     apply('numberOfMembers', String(p.numberOfMembers));
   }, payload);
 }

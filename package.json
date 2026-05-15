@@ -9,6 +9,7 @@
     "explore": "tsx src/cli.ts explore",
     "aoc4:open": "tsx src/cli.ts aoc4:open",
     "aoc4:walk": "tsx src/cli.ts aoc4:walk",
+    "aoc4:introspect": "tsx src/cli/aoc4-introspect.ts",
     "aoc4:capture": "tsx src/cli.ts aoc4:capture",
     "aoc4:prefill": "tsx src/cli.ts aoc4:prefill",
     "aoc4:fill": "tsx src/cli.ts aoc4:fill",
