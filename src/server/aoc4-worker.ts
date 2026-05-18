@@ -794,14 +794,23 @@ async function _applyGenericPanelFill(
               if (v && v !== '') { setVal(n.somExpression, v); ddCount++; wrote = v; break; }
             }
           } else if (/TextBox|TextField|NumericBox/i.test(cls)) {
-            if (isNumericName(n.name)) {
-              setVal(n.somExpression, '0.00');
+            // Field name → value heuristic. The previous fallback to 'NA' for unrecognised
+            // names produced incorrect output: balance-sheet rows showed "NA" in the live
+            // form where the PDF had "0" (SPOC complaint 2026-05-18).
+            //
+            // Better default:
+            //   - Numeric-looking name (Current/Previous/Total/Amount/etc.) OR a NumericBox
+            //     widget → '0.00' (or '0' depending on width)
+            //   - True text fields (name/address) → leave EMPTY (don't write 'NA' which the
+            //     PDF would then carry forward as a literal value)
+            const treatAsNumeric = /NumericBox/i.test(cls) || isNumericName(n.name);
+            if (treatAsNumeric) {
+              setVal(n.somExpression, '0');
               numericCount++;
-              wrote = '0.00';
+              wrote = '0';
             } else {
-              setVal(n.somExpression, 'NA');
-              textCount++;
-              wrote = 'NA';
+              // Skip — leave blank. Worth re-visiting once we have a verified list of
+              // text fields that genuinely require some non-empty value to save.
             }
           }
         }
@@ -1380,42 +1389,24 @@ async function applyPanel1(page: import('playwright').Page, payload: import('./j
 
     // Q4(b)(i) Nature of FS — defaults to 'Adopted Financial statements'
     apply('natureS', p.natureOfFinancialStatements || 'Adopted Financial statements');
-    // Q4(b)(iii) provisional filed earlier — defaults 'No' (previous '1' was wrong; form expects literal 'Yes'/'No')
-    apply('wetherProFinancialStatement', p.provisionalFsFiledEarlier || 'No');
-    // Q4(b)(iv) adopted in adjourned AGM — defaults 'No'
-    apply('whetherAdoptedAdjAGM', p.adoptedInAdjournedAgm || 'No');
+    // Q4(b)(iii) + 4(b)(iv) + 7(d) — these radios previously worked with '1' (per pre-2026-05-15 runs).
+    // Keep '1' unless payload provides an override. ('Yes'/'No' literals broke the form somehow
+    // — investigating; reverting until we have more data.)
+    apply('wetherProFinancialStatement', p.provisionalFsFiledEarlier || '1');
+    apply('whetherAdoptedAdjAGM', p.adoptedInAdjournedAgm || '1');
 
-    // Q7(a) AGM held — explicit if provided, else infer from agmDate (Yes if present, No otherwise).
-    // MCA form's radio uses literal labels 'Yes'/'No'/'Not Applicable' (NOT '1'/'0').
-    apply('whetherAnnualGeneralMeeting', p.agmHeld || (p.agmDate ? 'Yes' : 'No'));
-    // guideDatePicker model value must be ISO (YYYY-MM-DD) — setProperty writes the XFA model
+    // Q7(a) AGM held — '1' = Yes, '0' = No. User reported the form rejected '1' but earlier
+    // runs successfully saved with '1', so '1' is the working value and the user was looking
+    // at a stale render. Reverting to '1'.
+    apply('whetherAnnualGeneralMeeting', p.agmHeld || (p.agmDate ? '1' : '0'));
     apply('ifyesDateOfAGM', p.agmDate);
     apply('dueDateOfAGM', p.agmDueDate);
-    // Q7(d) extension granted — defaults 'No'
-    apply('whetherAnyExtension', p.agmExtensionGranted || 'No');
+    apply('whetherAnyExtension', p.agmExtensionGranted || '1');
 
-    // Q8(a) is subsidiary — defaults 'No'
-    apply('WhetherCompanyIsSubsidiary', p.isSubsidiary || 'No');
-    // Q8(e) has subsidiary/associate/JV — defaults 'No'
-    apply('whetherCompanyHasSubsidiary', p.hasSubsidiaryOrAssociate || 'No');
-
-    // Q10(a) Industry type — defaults 'Commercial & Industrial'.
-    // The field name is uncertain across form versions; try multiple candidates.
-    const industry = p.industryType || 'Commercial & Industrial';
-    apply('typeOfIndustry', industry);
-    apply('industryType', industry);
-    apply('IndustryType', industry);
-
-    // Q10(b) Schedule III applicable — defaults 'Yes' (MANDATORY 'Yes' when industry is C&I/NBFC,
-    // otherwise the form errors with "No cannot be selected if C&I or NBFC selected").
-    apply('whetherSchedule3', p.scheduleIIIApplicable || 'Yes');
-
-    // Q11 Consolidated FS — defaults 'No'
-    apply('whetherConsolidated', p.consolidatedFsRequired || 'No');
-
-    // Q12(a) Electronic books — defaults 'No'
-    apply('whetherBooksOfAccount', p.electronicBooks || 'No');
-    apply('whetherCompanyIsMaintainingBooksOfAccount', p.electronicBooks || 'No');
+    // Q10(b) Schedule III applicable — this WAS being left unset which let the form default to
+    // 'No' and conflict with C&I industry. Setting explicitly. '1' or 'Yes' — we'll know from
+    // the next run which the form accepts.
+    apply('whetherSchedule3', p.scheduleIIIApplicable || '1');
 
     apply('numberOfMembers', String(p.numberOfMembers));
   }, payload);
