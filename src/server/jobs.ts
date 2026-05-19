@@ -202,6 +202,27 @@ export interface Aoc4FormPayload {
   consolidatedFsRequired?: 'Yes' | 'No';
   /** 12(a) Whether books maintained electronically. Default 'No'. */
   electronicBooks?: 'Yes' | 'No';
+
+  /**
+   * Source-attachment references (PDFs uploaded by the SPOC). The worker downloads
+   * each from `url`, then attaches it to the corresponding MCA file-input slot.
+   * Slot ids are the schema field IDs (`attachFinancialStatements`, etc.) so the
+   * worker can route each file to its correct AEM widget.
+   */
+  attachments?: Partial<Record<
+    'attachFinancialStatements' | 'attachSupplementaryAuditReport' | 'attachCagComments'
+    | 'attachSecretarialAuditReport' | 'attachStatementForNotAdopted'
+    | 'attachStatementForNotHoldingAgm' | 'attachOptional',
+    { s3Key?: string; url: string; originalName?: string; mimetype?: string }
+  >>;
+
+  /** Full schema-shaped form data — carried through from the backend for the
+   *  worker to inspect any field the panel-N hand-curated functions don't cover. */
+  formData?: Record<string, unknown>;
+
+  /** Debug stats from the adapter — how many schema fields actually got
+   *  panelOverrides mappings (visible in worker logs for coverage tracking). */
+  _aemMappingStats?: { mapped: number; unmappedAem: number };
 }
 
 export interface Aoc4Job {

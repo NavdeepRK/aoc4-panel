@@ -602,10 +602,147 @@ export async function runAoc4Job(job: Aoc4Job, opts: { artifactDir: string; skip
     }
   }
 
+  // ─── SOURCE-ATTACHMENT UPLOAD (Segment VI attachments) ──────────────────────
+  // Best-effort: download each S3 attachment to a temp file, find the matching file
+  // input widget in the form's DOM, and use Playwright setInputFiles to upload.
+  // MCA uses a custom attachment widget that may not always expose <input type="file">,
+  // so this records every attempt to an artifact for diagnostics.
+  if (payload.attachments && Object.keys(payload.attachments).length > 0) {
+    try {
+      const attachReport = await uploadSourceAttachments(page, payload.attachments, opts.artifactDir, jobId, log);
+      fs.writeFileSync(
+        path.join(opts.artifactDir, `${jobId}-attachments.json`),
+        JSON.stringify(attachReport, null, 2),
+      );
+      log(`source attachments: ${attachReport.uploaded}/${attachReport.attempted} uploaded`);
+    } catch (e) {
+      log(`source attachment upload threw: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+
+  // Log mapping-stats coverage if the adapter included them
+  if ((payload as { _aemMappingStats?: { mapped: number; unmappedAem: number } })._aemMappingStats) {
+    const s = (payload as { _aemMappingStats: { mapped: number; unmappedAem: number } })._aemMappingStats;
+    log(`schema-driven aemField mapping: ${s.mapped} fields written via panelOverrides (${s.unmappedAem} aemFields had no matching panel)`);
+  }
+
   fs.writeFileSync(
     path.join(opts.artifactDir, `${jobId}-summary.json`),
     JSON.stringify({ jobId, srId: job.srId, phase: job.phase, panelResults: job.panelResults, draftPdfPath: job.draftPdfPath }, null, 2),
   );
+}
+
+/**
+ * Upload source-attachment PDFs (Segment VI) to MCA's per-slot file widgets.
+ *
+ * Each entry in `attachments` carries an HTTPS URL (the S3 public/pre-signed link
+ * the backend already stored against the ComplianceService). We:
+ *   1. fetch() each URL into memory (PDFs are capped at 6 MB per MCA)
+ *   2. Write to a temp file under the artifact dir (Playwright's setInputFiles
+ *      needs a real path, not a Buffer)
+ *   3. Probe the DOM for the MCA attachment widget — it exposes an Attach Documents
+ *      modal panel with one `<input type="file">` per slot. Selectors discovered live
+ *      typically follow the pattern `input[type=file][id*="<slotName>"]`. We try a
+ *      few patterns per slot and record what worked.
+ *
+ * Returns a per-slot report `{ slot, url, ok, error?, selector? }` for diagnostics.
+ */
+async function uploadSourceAttachments(
+  page: import('playwright').Page,
+  attachments: NonNullable<import('./jobs.js').Aoc4FormPayload['attachments']>,
+  artifactDir: string,
+  _jobId: string,
+  log: (msg: string) => void,
+): Promise<{ attempted: number; uploaded: number; results: Array<{ slot: string; url: string; ok: boolean; tempPath?: string; selector?: string; error?: string }> }> {
+  const results: Array<{ slot: string; url: string; ok: boolean; tempPath?: string; selector?: string; error?: string }> = [];
+
+  // Slot → candidate selector patterns. MCA AEM forms expose attachment inputs as
+  // hidden file inputs whose id/name contain the schema slot id or a slot-specific
+  // AEM widget name. Try id-contains first, then name-contains, then a broad class
+  // selector as a last resort.
+  // NOTE: the MCA AEM attachment widget historically maps slots by `metadataselector`
+  // attribute (e.g. metadataselector="attachFinancialStatements") — try that pattern too.
+  const SLOT_AEM_HINTS: Record<string, string[]> = {
+    attachFinancialStatements:      ['attachFinancialStatements', 'financialStatements', 'financialStatement', 'copyOfFinancialStatement'],
+    attachSupplementaryAuditReport: ['attachSupplementaryAuditReport', 'supplementaryAuditReport', 'supplementaryAudit'],
+    attachCagComments:              ['attachCagComments', 'cagComments', 'cagOfIndia', 'commentsOfCag'],
+    attachSecretarialAuditReport:   ['attachSecretarialAuditReport', 'secretarialAuditReport', 'secretarialAudit'],
+    attachStatementForNotAdopted:   ['attachStatementForNotAdopted', 'statementForNotAdopted', 'notAdopted'],
+    attachStatementForNotHoldingAgm:['attachStatementForNotHoldingAgm', 'notHoldingAgm', 'notHoldingAGM'],
+    attachOptional:                 ['attachOptional', 'optionalAttachment', 'optionalAttachments'],
+  };
+
+  // Make sure the Attach Documents panel is visible — MCA usually renders attachment
+  // inputs only after the user clicks an "Attach Documents" link/button. Try to
+  // navigate to the attachment section first.
+  await page.evaluate(() => {
+    // Look for any "Attach Documents" link or button and click it
+    const candidates = Array.from(document.querySelectorAll<HTMLElement>('a, button, [role="link"]'))
+      .filter(el => /attach\s*document/i.test(el.textContent ?? ''));
+    if (candidates.length > 0 && (candidates[0] as HTMLElement).offsetParent !== null) {
+      (candidates[0] as HTMLElement).click();
+    }
+  });
+  await page.waitForTimeout(2000);
+
+  for (const [slot, info] of Object.entries(attachments)) {
+    if (!info || !info.url) continue;
+    const slotResult: { slot: string; url: string; ok: boolean; tempPath?: string; selector?: string; error?: string } = {
+      slot, url: info.url, ok: false,
+    };
+    results.push(slotResult);
+
+    // 1) Download the file
+    let buf: Buffer;
+    try {
+      const r = await fetch(info.url);
+      if (!r.ok) { slotResult.error = `S3 fetch HTTP ${r.status}`; continue; }
+      buf = Buffer.from(await r.arrayBuffer());
+    } catch (e) {
+      slotResult.error = `S3 fetch threw: ${(e as Error).message}`;
+      continue;
+    }
+
+    const ext = '.pdf';
+    const tempPath = path.join(artifactDir, `attach-${slot}-${Date.now()}${ext}`);
+    fs.writeFileSync(tempPath, buf);
+    slotResult.tempPath = tempPath;
+    log(`attach ${slot}: downloaded ${buf.length} bytes -> ${path.basename(tempPath)}`);
+
+    // 2) Locate the file input. Try each candidate hint.
+    const hints = SLOT_AEM_HINTS[slot] ?? [slot];
+    let workingSelector: string | null = null;
+    for (const hint of hints) {
+      const sel = `input[type="file"][id*="${hint}"], input[type="file"][name*="${hint}"]`;
+      try {
+        const el = await page.$(sel);
+        if (el) { workingSelector = sel; break; }
+      } catch { /* try next */ }
+    }
+    if (!workingSelector) {
+      // Final fallback: any visible file input (only the first matching slot will succeed)
+      slotResult.error = `no file input found for slot — tried hints: ${hints.join(',')}`;
+      continue;
+    }
+
+    // 3) setInputFiles
+    try {
+      await page.setInputFiles(workingSelector, tempPath);
+      slotResult.ok = true;
+      slotResult.selector = workingSelector;
+      log(`attach ${slot}: uploaded via ${workingSelector}`);
+      // Brief wait for AEM to register the upload
+      await page.waitForTimeout(1500);
+    } catch (e) {
+      slotResult.error = `setInputFiles threw: ${(e as Error).message}`;
+    }
+  }
+
+  return {
+    attempted: results.length,
+    uploaded: results.filter(r => r.ok).length,
+    results,
+  };
 }
 
 /**
