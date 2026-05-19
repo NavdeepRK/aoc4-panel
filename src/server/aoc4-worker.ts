@@ -533,23 +533,11 @@ export async function runAoc4Job(job: Aoc4Job, opts: { artifactDir: string; skip
         );
       }
 
-      // Auditor fields (panel 2)
-      if (panelKey === 'panel2AOC4' && payload.auditor) await _applyPanel2Overrides(page, payload);
-
-      // Balance sheet / Schedule III (panel 3)
-      if (panelKey === 'panel3AOC4' && payload.scheduleIII) {
-        const applied = await _applyPanel3Overrides(page, payload, fillStats.fields);
-        log(`panel3 scheduleIII applied ${applied} field overrides`);
-      }
-
-      // P&L (panel 4)
-      // Panel 6 — P&L (discovered: P&L is in panel 6, panel 4 is additional disclosures)
-      if (panelKey === 'panel6AOC4' && payload.profitAndLoss) {
-        const applied = await _applyPanel6Overrides(page, payload);
-        log(`panel6 profitAndLoss applied ${applied} field overrides`);
-      }
-
-      // Caller-supplied direct field-name overrides (highest precedence)
+      // ALL field fills are now driven by `panelOverrides` (built schema-side from the
+      // ~93 scalar aemField mappings + the 528 BS_TABLE cell mappings + repeating-table
+      // row flattening). The legacy panel2/3/6 hand-curated functions have been removed
+      // in favor of this single code path.
+      // Caller-supplied direct field-name overrides:
       const shortKey = `panel${panelNum}` as 'panel1' | 'panel2' | 'panel3' | 'panel4' | 'panel5' | 'panel6' | 'panel7';
       const overrides = payload.panelOverrides?.[shortKey];
       if (overrides && Object.keys(overrides).length > 0) {
@@ -963,206 +951,13 @@ async function _applyGenericPanelFill(
   }, { panelKey, today: new Date().toISOString().slice(0, 10) });
 }
 
-/**
- * Panel 2 overrides — auditor section. The generic filler stuffs 'NA' / '0.00' into auditor
- * fields; this applies the small-Pvt preset's intended values where the payload supplies them.
- */
-async function _applyPanel2Overrides(
-  page: import('playwright').Page,
-  payload: import('./jobs.js').Aoc4FormPayload,
-): Promise<void> {
-  if (!payload.auditor) return;
-  await page.evaluate((aud: NonNullable<import('./jobs.js').Aoc4FormPayload['auditor']>) => {
-    type GuideNode = { name?: string; somExpression?: string; items?: GuideNode[] };
-    const gb = (window as unknown as { guideBridge: { resolveNode: (s: string) => unknown; setProperty: (s: string[], p: string, v: unknown[]) => void } }).guideBridge;
-    const root = gb.resolveNode('rootPanel') as GuideNode | null;
-    const findSom = (name: string): string | null => {
-      let found: string | null = null;
-      const walk = (n: GuideNode | undefined): void => {
-        if (!n || found) return;
-        if (n.name === name && n.somExpression) { found = n.somExpression; return; }
-        if (Array.isArray(n.items)) for (const k of n.items) walk(k);
-      }
-      walk(root ?? undefined);
-      return found;
-    }
-    const set = (name: string, v: string | undefined): void => {
-      if (v == null || v === '') return;
-      const s = findSom(name);
-      if (s) gb.setProperty([s], 'value', [v]);
-    };
-    if (aud.srnOfAdt1) set('SRNOfFormADT1', aud.srnOfAdt1);
-    set('numberAuditors', '1');
-    set('incomeTaxOfAuditor', aud.pan);
-    set('membershipNumberOfAuditor', aud.membershipNumber);
-    set('nameOfTheAuditor', aud.name);
-    // categoryOfAuditor: '1'=Individual, '2'=Firm  (discovered from AEM options)
-    if (aud.category) {
-      const catVal = aud.category.toLowerCase().includes('firm') ? '2' : '1'; // default Individual
-      set('categoryOfAuditor', catVal);
-    }
-    if (aud.address) {
-      set('addressLine1_Auditor', aud.address.line1);
-      set('addressLine2_Auditor', aud.address.line2);
-      set('pinCode_Auditor', aud.address.pincode);
-      set('city_Auditor', aud.address.city);
-      set('district_Auditor', aud.address.district);
-      set('state_Auditor', aud.address.state);
-    }
-    if (aud.signingMember) {
-      set('nameOfMember', aud.signingMember.name);
-      set('membershipNumber_Auditor', aud.signingMember.membershipNumber);
-    }
-  }, payload.auditor);
-}
-
-/**
- * Panel 3 — Schedule III balance sheet.
- *
- * AEM field name discovery (2026-05-13): balance sheet rows use a numbered pattern:
- *   FiguresAtEndOfCurrentReporting{N}  / figuresAsEndOfPreviousReporting{N}
- * where N maps to a fixed Schedule III line item. Keyword matching fails here because
- * the field names contain no financial term — we use a direct index map instead.
- *
- * Row → Schedule III line item (Companies Act Schedule III, Part I):
- *   1  → (a) Share capital
- *   2  → (b) Reserves and surplus
- *   6  → (a) Long term borrowings
- *   10 → (a) Short term borrowings
- *   11 → (b) Trade payables    (sub: outstandingDuesOfMicroEnterprises* + outstandingDuesOfOther*)
- *   12 → (c) Other current liabilities
- *   13 → (d) Short term provisions
- *   16 → (i) Property Plant and Equipment
- *   17 → (ii) Intangible assets
- *   22 → (d) Long term loans and advances
- *   25 → (b) Inventories
- *   27 → (d) Cash and cash equivalents
- *   28 → (e) Short term loans and advances
- *   29 → (f) Other current assets
- */
-async function _applyPanel3Overrides(
-  page: import('playwright').Page,
-  payload: import('./jobs.js').Aoc4FormPayload,
-  _fields: Array<{name: string; som: string; cls: string}>,
-): Promise<number> {
-  if (!payload.scheduleIII) return 0;
-  const s = payload.scheduleIII;
-
-  // Direct (rowIndex → {current, previous}) mapping — no keyword guessing
-  type Entry = { row: number; cur?: number; prev?: number };
-  const rows: Entry[] = [
-    { row: 1,  cur: s.equityShareCapital?.current,         prev: s.equityShareCapital?.previous },
-    { row: 2,  cur: s.otherEquity?.current,                prev: s.otherEquity?.previous },
-    { row: 6,  cur: s.longTermBorrowings?.current,         prev: s.longTermBorrowings?.previous },
-    { row: 10, cur: s.shortTermBorrowings?.current,        prev: s.shortTermBorrowings?.previous },
-    { row: 12, cur: s.otherCurrentLiabilities?.current,    prev: s.otherCurrentLiabilities?.previous },
-    { row: 13, cur: s.shortTermProvisions?.current,        prev: s.shortTermProvisions?.previous },
-    { row: 16, cur: s.fixedAssets?.current,                prev: s.fixedAssets?.previous },
-    { row: 22, cur: s.longTermLoansAndAdvances?.current,   prev: s.longTermLoansAndAdvances?.previous },
-    { row: 25, cur: s.inventories?.current,                prev: s.inventories?.previous },
-    { row: 27, cur: s.cashAndCashEquivalents?.current,     prev: s.cashAndCashEquivalents?.previous },
-    { row: 28, cur: s.shortTermLoansAndAdvances?.current,  prev: s.shortTermLoansAndAdvances?.previous },
-    { row: 29, cur: s.otherCurrentAssets?.current,         prev: s.otherCurrentAssets?.previous },
-  ];
-
-  return await page.evaluate((entries: Entry[]) => {
-    const gb = (window as unknown as { guideBridge: { resolveNode: (s: string) => unknown; setProperty: (s: string[], p: string, v: unknown[]) => void } }).guideBridge;
-    type GN = { name?: string; somExpression?: string; items?: GN[] };
-    const root = gb.resolveNode('rootPanel') as GN | null;
-    const somByName = new Map<string, string>();
-    const collect = (n: GN | undefined): void => {
-      if (!n) return;
-      if (n.name && n.somExpression) somByName.set(n.name, n.somExpression);
-      if (Array.isArray(n.items)) for (const c of n.items) collect(c);
-    };
-    collect(root ?? undefined);
-    const set = (name: string, v: number | undefined): boolean => {
-      if (v == null) return false;
-      const som = somByName.get(name);
-      if (!som) return false;
-      try { gb.setProperty([som], 'value', [String(v)]); return true; } catch { return false; }
-    };
-    let count = 0;
-    for (const e of entries) {
-      if (set(`FiguresAtEndOfCurrentReporting${e.row}`, e.cur)) count++;
-      if (set(`figuresAsEndOfPreviousReporting${e.row}`, e.prev)) count++;
-    }
-    return count;
-  }, rows);
-}
-
-/**
- * Panel 6 — Profit & Loss (Segment II).
- *
- * AEM field name discovery (2026-05-13): P&L fields are in panel 6 (not panel 4).
- * All P&L items use the pattern revenueFromOperationsCurrentN where N maps to a
- * specific line in the Schedule III Part II / Segment II:
- *   10 → Total Income (I+II)                    — use for totalRevenue
- *   11 → (a) Cost of materials consumed
- *   16 → (d) Employee benefit expenses
- *   21 → (i) Finance costs
- *   22 → (j) Depreciation and amortization
- *   23 → (k) Other expenses
- *   24 → Total expenses
- *   25 → Profit before exceptional items and tax
- *   29 → Profit before tax
- *   32 → Profit/(Loss) from continuing operations — use for profitAfterTax
- *   36 → Profit/(Loss) (XI+XIV)                  — final PAT line
- *
- * Previous-year versions have a parallel set (captured via revenueFromOperationsPrevious{N}
- * or similar — validate against actual artifact if needed).
- */
-async function _applyPanel6Overrides(
-  page: import('playwright').Page,
-  payload: import('./jobs.js').Aoc4FormPayload,
-): Promise<number> {
-  if (!payload.profitAndLoss) return 0;
-  const pnl = payload.profitAndLoss;
-
-  type PnlEntry = { name: string; cur?: number; prev?: number };
-  const entries: PnlEntry[] = [
-    // Revenue
-    { name: 'revenueFromOperationsCurrent10', cur: pnl.totalRevenue?.current,         prev: pnl.totalRevenue?.previous },
-    // Expenses
-    { name: 'revenueFromOperationsCurrent11', cur: pnl.costOfMaterialsConsumed?.current, prev: pnl.costOfMaterialsConsumed?.previous },
-    { name: 'revenueFromOperationsCurrent16', cur: pnl.employeeBenefitExpense?.current,  prev: pnl.employeeBenefitExpense?.previous },
-    { name: 'revenueFromOperationsCurrent21', cur: pnl.financeCharges?.current,           prev: pnl.financeCharges?.previous },
-    { name: 'revenueFromOperationsCurrent22', cur: pnl.depreciationAndAmortisation?.current, prev: pnl.depreciationAndAmortisation?.previous },
-    { name: 'revenueFromOperationsCurrent23', cur: pnl.otherExpenses?.current,            prev: pnl.otherExpenses?.previous },
-    { name: 'revenueFromOperationsCurrent24', cur: pnl.totalExpenses?.current,            prev: pnl.totalExpenses?.previous },
-    // Profit lines
-    { name: 'revenueFromOperationsCurrent25', cur: pnl.profitBeforeTax?.current,          prev: pnl.profitBeforeTax?.previous },
-    { name: 'revenueFromOperationsCurrent29', cur: pnl.profitBeforeTax?.current,          prev: pnl.profitBeforeTax?.previous },
-    { name: 'revenueFromOperationsCurrent36', cur: pnl.profitAfterTax?.current,           prev: pnl.profitAfterTax?.previous },
-  ];
-
-  return await page.evaluate((items: PnlEntry[]) => {
-    const gb = (window as unknown as { guideBridge: { resolveNode: (s: string) => unknown; setProperty: (s: string[], p: string, v: unknown[]) => void } }).guideBridge;
-    type GN = { name?: string; somExpression?: string; items?: GN[] };
-    const root = gb.resolveNode('rootPanel') as GN | null;
-    const somByName = new Map<string, string>();
-    const collect = (n: GN | undefined): void => {
-      if (!n) return;
-      if (n.name && n.somExpression) somByName.set(n.name, n.somExpression);
-      if (Array.isArray(n.items)) for (const c of n.items) collect(c);
-    };
-    collect(root ?? undefined);
-    const set = (name: string, v: number | undefined): boolean => {
-      if (v == null) return false;
-      const som = somByName.get(name);
-      if (!som) return false;
-      try { gb.setProperty([som], 'value', [String(v)]); return true; } catch { return false; }
-    };
-    let count = 0;
-    for (const e of items) {
-      if (set(e.name, e.cur)) count++;
-      // Previous year: try revenueFromOperationsPreviousN pattern
-      const prevName = e.name.replace('Current', 'Previous');
-      if (set(prevName, e.prev)) count++;
-    }
-    return count;
-  }, entries);
-}
+// NOTE (Phase A-F rewrite, 2026-05-19): The legacy _applyPanel2Overrides,
+// _applyPanel3Overrides, and _applyPanel6Overrides functions have been
+// removed. ALL field fills now go through the schema-driven panelOverrides
+// bucket consumed by _applyDirectOverrides. The adapter side of the contract
+// (utils/aoc4FormDataToPayload.js) builds those buckets from the schema as
+// aemField mappings + 528 BS_TABLE cell mappings (cell-mappings.json) +
+// repeating-TABLE row flattening. One code path, end-to-end.
 
 /**
  * Upload the DSC-signed PDF back to MCA, then trigger the form's submit confirmation.
