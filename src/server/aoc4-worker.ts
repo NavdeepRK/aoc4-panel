@@ -1095,33 +1095,125 @@ async function _invokeAemDraftSave(
 }
 
 /**
- * Apply caller-supplied field-name → value overrides via setProperty. Returns the count
- * of overrides successfully applied (a value <count means some field names didn't match
- * anything in the form tree — typically a stale name).
+ * Apply caller-supplied field-name → value overrides via setProperty.
+ *
+ * IMPORTANT: AEM radio buttons and dropdowns use option `value` codes that differ
+ * from the human-readable `label` text (e.g. a Yes/No/Not Applicable radio might
+ * have option values `'0'`, `'1'`, `'2'`). Sending the literal string `'No'` to
+ * `setProperty` does NOT match any option — the form silently falls back to its
+ * default (typically Not Applicable for tri-state radios).
+ *
+ * For radio + dropdown widgets we therefore translate the incoming label to the
+ * actual option value by inspecting the rendered DOM: find the `<input>` /
+ * `<option>` whose label text matches our payload value, then either click it
+ * (radio) or set `select.value` (dropdown) and fire change events so AEM picks
+ * up the validation.
+ *
+ * Returns count of overrides successfully written.
  */
 async function _applyDirectOverrides(
   page: import('playwright').Page,
   overrides: Record<string, string | number>,
 ): Promise<number> {
   return await page.evaluate((entries) => {
-    type GuideNode = { name?: string; somExpression?: string; items?: GuideNode[] };
+    type GuideNode = {
+      name?: string;
+      somExpression?: string;
+      className?: string;
+      items?: GuideNode[];
+      _view?: { element?: HTMLElement };
+    };
     const gb = (window as unknown as { guideBridge: { resolveNode: (s: string) => unknown; setProperty: (s: string[], p: string, v: unknown[]) => void } }).guideBridge;
     const root = gb.resolveNode('rootPanel') as GuideNode | null;
-    const findSom = (name: string): string | null => {
-      let found: string | null = null;
+
+    const findNode = (name: string): GuideNode | null => {
+      let found: GuideNode | null = null;
       const walk = (n: GuideNode | undefined): void => {
         if (!n || found) return;
-        if (n.name === name && n.somExpression) { found = n.somExpression; return; }
+        if (n.name === name && n.somExpression) { found = n; return; }
         if (Array.isArray(n.items)) for (const k of n.items) walk(k);
       };
       walk(root ?? undefined);
       return found;
     };
+
+    /** Match a label against an option's textContent (case-insensitive, trimmed). */
+    const labelMatches = (haystack: string | null | undefined, needle: string): boolean => {
+      if (!haystack) return false;
+      const a = haystack.trim().toLowerCase();
+      const b = needle.trim().toLowerCase();
+      return a === b || a.includes(b) || b.includes(a);
+    };
+
+    /** Set a radio by clicking the input whose adjacent label matches `valueLabel`. */
+    const setRadio = (node: GuideNode, som: string, valueLabel: string): boolean => {
+      // First try plain setProperty in case the form accepts the literal value.
+      try { gb.setProperty([som], 'value', [valueLabel]); } catch { /* */ }
+      const container = node._view?.element;
+      if (!container) return false;
+      const radios = Array.from(container.querySelectorAll<HTMLInputElement>('input[type="radio"]'));
+      for (const r of radios) {
+        // The radio's label may be a sibling <label for="id"> or an enclosing <label>
+        const id = r.id;
+        let labelText: string | null = null;
+        if (id) {
+          const lbl = container.ownerDocument.querySelector<HTMLLabelElement>(`label[for="${id}"]`);
+          if (lbl) labelText = lbl.textContent;
+        }
+        if (!labelText) {
+          const parentLabel = r.closest('label');
+          if (parentLabel) labelText = parentLabel.textContent;
+        }
+        // Also check radio's aria-label / value as fallback
+        if (!labelText) labelText = r.getAttribute('aria-label') ?? r.value;
+        if (labelMatches(labelText, valueLabel)) {
+          // Found — use the radio's own .value (AEM option value) as the model write,
+          // then click the input so the form fires its change/blur listeners.
+          try { gb.setProperty([som], 'value', [r.value]); } catch { /* */ }
+          r.checked = true;
+          r.click();
+          r.dispatchEvent(new Event('input', { bubbles: true }));
+          r.dispatchEvent(new Event('change', { bubbles: true }));
+          r.dispatchEvent(new Event('blur', { bubbles: true }));
+          return true;
+        }
+      }
+      return false;
+    };
+
+    /** Set a dropdown by label-matching its <option> children. */
+    const setDropdown = (node: GuideNode, som: string, valueLabel: string): boolean => {
+      try { gb.setProperty([som], 'value', [valueLabel]); } catch { /* */ }
+      const select = node._view?.element?.querySelector<HTMLSelectElement>('select');
+      if (!select) return false;
+      let matched: HTMLOptionElement | null = null;
+      for (const o of Array.from(select.options)) {
+        if (labelMatches(o.textContent, valueLabel)) { matched = o; break; }
+      }
+      if (!matched) return false;
+      select.value = matched.value;
+      try { gb.setProperty([som], 'value', [matched.value]); } catch { /* */ }
+      select.dispatchEvent(new Event('input', { bubbles: true }));
+      select.dispatchEvent(new Event('change', { bubbles: true }));
+      select.dispatchEvent(new Event('blur', { bubbles: true }));
+      return true;
+    };
+
     let count = 0;
     for (const [name, value] of entries) {
-      const som = findSom(name);
-      if (!som) continue;
-      try { gb.setProperty([som], 'value', [String(value)]); count++; } catch { /* skip */ }
+      const node = findNode(name);
+      if (!node || !node.somExpression) continue;
+      const cls = node.className ?? '';
+      const strVal = String(value);
+      let ok = false;
+      if (/RadioButton/i.test(cls)) {
+        ok = setRadio(node, node.somExpression, strVal);
+      } else if (/DropDownList/i.test(cls)) {
+        ok = setDropdown(node, node.somExpression, strVal);
+      } else {
+        try { gb.setProperty([node.somExpression], 'value', [strVal]); ok = true; } catch { /* */ }
+      }
+      if (ok) count++;
     }
     return count;
   }, Object.entries(overrides));
