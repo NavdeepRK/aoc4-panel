@@ -1151,41 +1151,22 @@ async function _applyDirectOverrides(
     };
 
     /**
-     * Derive the AEM widget DOM ID from a SOM expression.
-     *
-     * AEM Forms convention: a SOM like
-     *   guide[0].guide1[0].guideRootPanel[0].mainPanel[0]...whetherSchedule3[0]
-     * renders as a DOM container with id
-     *   guideContainer-rootPanel-mainPanel-...-whetherSchedule3___widget
-     *
-     * We strip `guide[0].guide1[0].` prefix, replace `[0].` separators with `-`,
-     * drop trailing `[0]`, prepend `guideContainer-`, append `___widget`.
+     * Find all DOM elements belonging to a field by scanning every element with
+     * an `id` attribute and matching field name as a path segment. AEM widget IDs
+     * are like `guideContainer-...-WhetherCompanyIsSubsidiary-...___widget` —
+     * unstable across panels but the field name always appears as a path segment
+     * delimited by `-` or `_`.
      */
-    const somToWidgetId = (som: string): string => {
-      let s = som.replace(/^guide\[0\]\.guide1\[0\]\./, '');
-      s = s.replace(/\[0\]\./g, '-');
-      s = s.replace(/\[0\]$/, '');
-      return `guideContainer-${s}___widget`;
+    const elementsForField = (fieldName: string): HTMLElement[] => {
+      const out: HTMLElement[] = [];
+      const re = new RegExp(`(^|[-_/])${fieldName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}([-_/]|$)`);
+      const all = document.querySelectorAll<HTMLElement>('[id]');
+      for (const el of Array.from(all)) {
+        if (re.test(el.id)) out.push(el);
+      }
+      return out;
     };
 
-    /**
-     * Locate a field's DOM container using multiple strategies:
-     *   1. node._view.element (AEM internal — works when the view is bound)
-     *   2. SOM → widget DOM ID
-     *   3. Document-wide search by AEM field name (input/name attribute contains the field id)
-     */
-    const findWidgetContainer = (node: GuideNode, fieldName: string): HTMLElement | null => {
-      if (node._view?.element) return node._view.element;
-      if (node.somExpression) {
-        const wid = somToWidgetId(node.somExpression);
-        const el = document.getElementById(wid);
-        if (el) return el;
-        // Sometimes the widget id has extra suffix variants
-        const fuzzy = document.querySelector<HTMLElement>(`[id$="${fieldName}___widget"], [id*="${fieldName}-"]`);
-        if (fuzzy) return fuzzy;
-      }
-      return null;
-    };
 
     /**
      * Set a radio by:
@@ -1196,17 +1177,55 @@ async function _applyDirectOverrides(
      *   4. Matching the payload label against any of those
      *   5. Writing the matched radio's `.value` to setProperty AND clicking the input AND firing events
      */
-    const setRadio = (node: GuideNode, som: string, valueLabel: string, fieldName: string): { ok: boolean; reason: string; finalValue?: string } => {
-      const container = findWidgetContainer(node, fieldName);
-      if (!container) {
-        return { ok: false, reason: 'no widget container found in DOM (tried _view, somToWidgetId, fuzzy)' };
+    /**
+     * Yes/No/NA → numeric AEM enum value translation. The legacy worker established
+     * '1' = Yes and '0' = No for binary radios via `apply('whetherAnnualGeneralMeeting', '1')`
+     * and similar calls that demonstrably worked. Tri-state radios use '2' for Not Applicable.
+     */
+    const labelToEnumGuesses = (label: string): string[] => {
+      const l = label.trim().toLowerCase();
+      if (l === 'yes')             return ['1', '0', 'Yes'];
+      if (l === 'no')              return ['0', '1', 'No'];
+      if (l === 'not applicable')  return ['2', '3', 'Not Applicable'];
+      if (l === 'individual')      return ['1', '0', 'Individual'];
+      if (l.includes('firm') || l.includes('auditor')) return ['2', '1', label];
+      return [label]; // unknown — try as-is
+    };
+
+    const setRadio = (_node: GuideNode, som: string, valueLabel: string, fieldName: string): { ok: boolean; reason: string; finalValue?: string } => {
+      // Collect candidate radio inputs by walking every element with an id that contains
+      // the field name (case-insensitive, no path-segment boundary requirement).
+      const fieldLower = fieldName.toLowerCase();
+      const radioSet = new Set<HTMLInputElement>();
+      for (const el of Array.from(document.querySelectorAll<HTMLElement>('[id]'))) {
+        if (el.id.toLowerCase().includes(fieldLower)) {
+          for (const r of Array.from(el.querySelectorAll<HTMLInputElement>('input[type="radio"]'))) {
+            radioSet.add(r);
+          }
+        }
       }
-      const radios = Array.from(container.querySelectorAll<HTMLInputElement>('input[type="radio"]'));
+      // Also try by name attribute (AEM sometimes uses field name as the radio group name)
+      if (radioSet.size === 0) {
+        for (const r of Array.from(document.querySelectorAll<HTMLInputElement>(`input[type="radio"]`))) {
+          if ((r.name ?? '').toLowerCase().includes(fieldLower) || (r.id ?? '').toLowerCase().includes(fieldLower)) {
+            radioSet.add(r);
+          }
+        }
+      }
+      const radios = Array.from(radioSet);
+
+      // If DOM-click path isn't available, fall back to setProperty with multiple value
+      // encodings. The legacy worker proved that `setProperty(som, '1')` lands cleanly on
+      // the AEM model for these radios even when the DOM isn't rendered yet.
       if (radios.length === 0) {
-        // Last-resort global search by name attribute
-        const fallback = Array.from(document.querySelectorAll<HTMLInputElement>(`input[type="radio"][name*="${fieldName}"]`));
-        if (fallback.length === 0) return { ok: false, reason: `no radios found in widget (${container.id || 'no-id'})` };
-        radios.push(...fallback);
+        const guesses = labelToEnumGuesses(valueLabel);
+        for (const guess of guesses) {
+          try {
+            gb.setProperty([som], 'value', [guess]);
+            return { ok: true, reason: `setProperty-only (DOM not rendered): "${guess}" for label "${valueLabel}"`, finalValue: guess };
+          } catch { /* try next guess */ }
+        }
+        return { ok: false, reason: `no DOM radios + all setProperty guesses failed for "${valueLabel}"` };
       }
 
       const collectLabels = (r: HTMLInputElement): string[] => {
@@ -1254,11 +1273,36 @@ async function _applyDirectOverrides(
     };
 
     /** Set a dropdown by label-matching its <option> children. */
-    const setDropdown = (node: GuideNode, som: string, valueLabel: string, fieldName: string): { ok: boolean; reason: string; finalValue?: string } => {
-      const container = findWidgetContainer(node, fieldName);
-      const select = container?.querySelector<HTMLSelectElement>('select')
-                 ?? document.querySelector<HTMLSelectElement>(`select[name*="${fieldName}"]`);
-      if (!select) return { ok: false, reason: 'no <select> found in widget' };
+    const setDropdown = (_node: GuideNode, som: string, valueLabel: string, fieldName: string): { ok: boolean; reason: string; finalValue?: string } => {
+      // Try every container that has the field name in its id, then look for a <select>
+      let select: HTMLSelectElement | null = null;
+      for (const el of elementsForField(fieldName)) {
+        const s = el.querySelector<HTMLSelectElement>('select');
+        if (s) { select = s; break; }
+      }
+      if (!select) {
+        select = document.querySelector<HTMLSelectElement>(`select[name*="${fieldName}"]`)
+              ?? document.querySelector<HTMLSelectElement>(`select[id*="${fieldName}"]`);
+      }
+      if (!select) {
+        // Some AEM dropdowns are rendered as <input> with a custom widget. Try a text input.
+        const inputAsDropdown = elementsForField(fieldName).find(el => el.tagName === 'INPUT') as HTMLInputElement | undefined;
+        if (inputAsDropdown) {
+          try { gb.setProperty([som], 'value', [valueLabel]); } catch { /* */ }
+          inputAsDropdown.value = valueLabel;
+          inputAsDropdown.dispatchEvent(new Event('input',  { bubbles: true }));
+          inputAsDropdown.dispatchEvent(new Event('change', { bubbles: true }));
+          inputAsDropdown.dispatchEvent(new Event('blur',   { bubbles: true }));
+          return { ok: true, reason: `wrote to <input> widget (dropdown-styled): "${valueLabel}"`, finalValue: valueLabel };
+        }
+        // Final fallback: just write the value via setProperty. Works for off-screen dropdowns.
+        try {
+          gb.setProperty([som], 'value', [valueLabel]);
+          return { ok: true, reason: `setProperty-only (DOM not rendered): "${valueLabel}"`, finalValue: valueLabel };
+        } catch (e) {
+          return { ok: false, reason: `no <select>/<input> + setProperty threw: ${(e as Error).message}` };
+        }
+      }
 
       let matched: HTMLOptionElement | null = null;
       const sampledOptions: Array<{ v: string; t: string }> = [];
