@@ -541,8 +541,12 @@ export async function runAoc4Job(job: Aoc4Job, opts: { artifactDir: string; skip
       const shortKey = `panel${panelNum}` as 'panel1' | 'panel2' | 'panel3' | 'panel4' | 'panel5' | 'panel6' | 'panel7';
       const overrides = payload.panelOverrides?.[shortKey];
       if (overrides && Object.keys(overrides).length > 0) {
-        const applied = await _applyDirectOverrides(page, overrides);
-        log(`panel${panelNum} applied ${applied}/${Object.keys(overrides).length} direct overrides`);
+        const overrideResult = await _applyDirectOverrides(page, overrides);
+        fs.writeFileSync(
+          path.join(opts.artifactDir, `${jobId}-panel${panelNum}-overrides.json`),
+          JSON.stringify(overrideResult, null, 2),
+        );
+        log(`panel${panelNum} applied ${overrideResult.count}/${Object.keys(overrides).length} direct overrides (see panel${panelNum}-overrides.json)`);
       }
 
       setPhase(jobId, 'SAVING_PANEL', { panelInProgress: panelNum });
@@ -609,9 +613,10 @@ export async function runAoc4Job(job: Aoc4Job, opts: { artifactDir: string; skip
   }
 
   // Log mapping-stats coverage if the adapter included them
-  if ((payload as { _aemMappingStats?: { mapped: number; unmappedAem: number } })._aemMappingStats) {
-    const s = (payload as { _aemMappingStats: { mapped: number; unmappedAem: number } })._aemMappingStats;
-    log(`schema-driven aemField mapping: ${s.mapped} fields written via panelOverrides (${s.unmappedAem} aemFields had no matching panel)`);
+  type Stats = { scalarMapped?: number; cellMapped?: number; tableRowsFlat?: number; totalWrites?: number; scalarUnmappedPanel?: number };
+  const stats = (payload as { _aemMappingStats?: Stats })._aemMappingStats;
+  if (stats) {
+    log(`schema-driven aemField mapping: scalars=${stats.scalarMapped ?? 0}, cells=${stats.cellMapped ?? 0}, tableRows=${stats.tableRowsFlat ?? 0}, total=${stats.totalWrites ?? 0} (${stats.scalarUnmappedPanel ?? 0} scalars unmapped)`);
   }
 
   fs.writeFileSync(
@@ -1114,7 +1119,7 @@ async function _invokeAemDraftSave(
 async function _applyDirectOverrides(
   page: import('playwright').Page,
   overrides: Record<string, string | number>,
-): Promise<number> {
+): Promise<{ count: number; results: Array<{ name: string; value: string; ok: boolean; widget: string; reason: string; finalValue?: string }> }> {
   return await page.evaluate((entries) => {
     type GuideNode = {
       name?: string;
@@ -1145,77 +1150,162 @@ async function _applyDirectOverrides(
       return a === b || a.includes(b) || b.includes(a);
     };
 
-    /** Set a radio by clicking the input whose adjacent label matches `valueLabel`. */
-    const setRadio = (node: GuideNode, som: string, valueLabel: string): boolean => {
-      // First try plain setProperty in case the form accepts the literal value.
-      try { gb.setProperty([som], 'value', [valueLabel]); } catch { /* */ }
-      const container = node._view?.element;
-      if (!container) return false;
+    /**
+     * Derive the AEM widget DOM ID from a SOM expression.
+     *
+     * AEM Forms convention: a SOM like
+     *   guide[0].guide1[0].guideRootPanel[0].mainPanel[0]...whetherSchedule3[0]
+     * renders as a DOM container with id
+     *   guideContainer-rootPanel-mainPanel-...-whetherSchedule3___widget
+     *
+     * We strip `guide[0].guide1[0].` prefix, replace `[0].` separators with `-`,
+     * drop trailing `[0]`, prepend `guideContainer-`, append `___widget`.
+     */
+    const somToWidgetId = (som: string): string => {
+      let s = som.replace(/^guide\[0\]\.guide1\[0\]\./, '');
+      s = s.replace(/\[0\]\./g, '-');
+      s = s.replace(/\[0\]$/, '');
+      return `guideContainer-${s}___widget`;
+    };
+
+    /**
+     * Locate a field's DOM container using multiple strategies:
+     *   1. node._view.element (AEM internal — works when the view is bound)
+     *   2. SOM → widget DOM ID
+     *   3. Document-wide search by AEM field name (input/name attribute contains the field id)
+     */
+    const findWidgetContainer = (node: GuideNode, fieldName: string): HTMLElement | null => {
+      if (node._view?.element) return node._view.element;
+      if (node.somExpression) {
+        const wid = somToWidgetId(node.somExpression);
+        const el = document.getElementById(wid);
+        if (el) return el;
+        // Sometimes the widget id has extra suffix variants
+        const fuzzy = document.querySelector<HTMLElement>(`[id$="${fieldName}___widget"], [id*="${fieldName}-"]`);
+        if (fuzzy) return fuzzy;
+      }
+      return null;
+    };
+
+    /**
+     * Set a radio by:
+     *   1. Locating the widget container
+     *   2. Walking ALL <input type="radio"> children
+     *   3. For each, finding its associated label text via (a) label[for=id], (b) closest <label>,
+     *      (c) the immediate next-sibling text, (d) aria-label, (e) the input value itself
+     *   4. Matching the payload label against any of those
+     *   5. Writing the matched radio's `.value` to setProperty AND clicking the input AND firing events
+     */
+    const setRadio = (node: GuideNode, som: string, valueLabel: string, fieldName: string): { ok: boolean; reason: string; finalValue?: string } => {
+      const container = findWidgetContainer(node, fieldName);
+      if (!container) {
+        return { ok: false, reason: 'no widget container found in DOM (tried _view, somToWidgetId, fuzzy)' };
+      }
       const radios = Array.from(container.querySelectorAll<HTMLInputElement>('input[type="radio"]'));
-      for (const r of radios) {
-        // The radio's label may be a sibling <label for="id"> or an enclosing <label>
-        const id = r.id;
-        let labelText: string | null = null;
-        if (id) {
-          const lbl = container.ownerDocument.querySelector<HTMLLabelElement>(`label[for="${id}"]`);
-          if (lbl) labelText = lbl.textContent;
+      if (radios.length === 0) {
+        // Last-resort global search by name attribute
+        const fallback = Array.from(document.querySelectorAll<HTMLInputElement>(`input[type="radio"][name*="${fieldName}"]`));
+        if (fallback.length === 0) return { ok: false, reason: `no radios found in widget (${container.id || 'no-id'})` };
+        radios.push(...fallback);
+      }
+
+      const collectLabels = (r: HTMLInputElement): string[] => {
+        const out: string[] = [];
+        if (r.id) {
+          const lbl = document.querySelector<HTMLLabelElement>(`label[for="${CSS.escape(r.id)}"]`);
+          if (lbl?.textContent) out.push(lbl.textContent);
         }
-        if (!labelText) {
-          const parentLabel = r.closest('label');
-          if (parentLabel) labelText = parentLabel.textContent;
+        const parentLabel = r.closest('label');
+        if (parentLabel?.textContent) out.push(parentLabel.textContent);
+        // Next-sibling text node (common AEM rendering)
+        if (r.nextSibling?.nodeType === Node.TEXT_NODE) {
+          const t = r.nextSibling.textContent;
+          if (t) out.push(t);
         }
-        // Also check radio's aria-label / value as fallback
-        if (!labelText) labelText = r.getAttribute('aria-label') ?? r.value;
-        if (labelMatches(labelText, valueLabel)) {
-          // Found — use the radio's own .value (AEM option value) as the model write,
-          // then click the input so the form fires its change/blur listeners.
+        // Next-sibling element
+        if (r.nextElementSibling?.textContent) out.push(r.nextElementSibling.textContent);
+        const aria = r.getAttribute('aria-label');
+        if (aria) out.push(aria);
+        if (r.value) out.push(r.value);
+        return out;
+      };
+
+      const sampledLabels: Array<{ idx: number; value: string; labels: string[] }> = [];
+      for (let i = 0; i < radios.length; i++) {
+        const r = radios[i];
+        const labels = collectLabels(r);
+        sampledLabels.push({ idx: i, value: r.value, labels });
+        if (labels.some(l => labelMatches(l, valueLabel))) {
+          // Match found
           try { gb.setProperty([som], 'value', [r.value]); } catch { /* */ }
           r.checked = true;
-          r.click();
-          r.dispatchEvent(new Event('input', { bubbles: true }));
+          try { r.click(); } catch { /* some browsers throw if click is intercepted */ }
+          r.dispatchEvent(new Event('input',  { bubbles: true }));
           r.dispatchEvent(new Event('change', { bubbles: true }));
-          r.dispatchEvent(new Event('blur', { bubbles: true }));
-          return true;
+          r.dispatchEvent(new Event('blur',   { bubbles: true }));
+          return { ok: true, reason: `clicked radio[${i}] value="${r.value}" matched "${labels[0] || '?'}"`, finalValue: r.value };
         }
       }
-      return false;
+      // Nothing matched. Return diagnostic info so we can fix the schema.
+      return {
+        ok: false,
+        reason: `no radio label matched "${valueLabel}". Available: ${JSON.stringify(sampledLabels.map(s => ({ v: s.value, l: s.labels[0]?.trim()?.slice(0, 30) })))}`,
+      };
     };
 
     /** Set a dropdown by label-matching its <option> children. */
-    const setDropdown = (node: GuideNode, som: string, valueLabel: string): boolean => {
-      try { gb.setProperty([som], 'value', [valueLabel]); } catch { /* */ }
-      const select = node._view?.element?.querySelector<HTMLSelectElement>('select');
-      if (!select) return false;
+    const setDropdown = (node: GuideNode, som: string, valueLabel: string, fieldName: string): { ok: boolean; reason: string; finalValue?: string } => {
+      const container = findWidgetContainer(node, fieldName);
+      const select = container?.querySelector<HTMLSelectElement>('select')
+                 ?? document.querySelector<HTMLSelectElement>(`select[name*="${fieldName}"]`);
+      if (!select) return { ok: false, reason: 'no <select> found in widget' };
+
       let matched: HTMLOptionElement | null = null;
+      const sampledOptions: Array<{ v: string; t: string }> = [];
       for (const o of Array.from(select.options)) {
+        const t = (o.textContent ?? '').trim();
+        sampledOptions.push({ v: o.value, t: t.slice(0, 30) });
         if (labelMatches(o.textContent, valueLabel)) { matched = o; break; }
       }
-      if (!matched) return false;
+      if (!matched) return { ok: false, reason: `no option matched "${valueLabel}". Available: ${JSON.stringify(sampledOptions)}` };
       select.value = matched.value;
       try { gb.setProperty([som], 'value', [matched.value]); } catch { /* */ }
-      select.dispatchEvent(new Event('input', { bubbles: true }));
+      select.dispatchEvent(new Event('input',  { bubbles: true }));
       select.dispatchEvent(new Event('change', { bubbles: true }));
-      select.dispatchEvent(new Event('blur', { bubbles: true }));
-      return true;
+      select.dispatchEvent(new Event('blur',   { bubbles: true }));
+      return { ok: true, reason: `selected option "${matched.textContent?.trim()}" value="${matched.value}"`, finalValue: matched.value };
     };
 
+    const results: Array<{ name: string; value: string; ok: boolean; widget: string; reason: string; finalValue?: string }> = [];
     let count = 0;
     for (const [name, value] of entries) {
       const node = findNode(name);
-      if (!node || !node.somExpression) continue;
-      const cls = node.className ?? '';
       const strVal = String(value);
-      let ok = false;
-      if (/RadioButton/i.test(cls)) {
-        ok = setRadio(node, node.somExpression, strVal);
-      } else if (/DropDownList/i.test(cls)) {
-        ok = setDropdown(node, node.somExpression, strVal);
-      } else {
-        try { gb.setProperty([node.somExpression], 'value', [strVal]); ok = true; } catch { /* */ }
+      if (!node || !node.somExpression) {
+        results.push({ name, value: strVal, ok: false, widget: '-', reason: 'AEM node not found by name' });
+        continue;
       }
-      if (ok) count++;
+      const cls = node.className ?? '';
+      const widgetType =
+        /RadioButton/i.test(cls)   ? 'radio'    :
+        /DropDownList/i.test(cls)  ? 'dropdown' :
+        /CheckBox/i.test(cls)      ? 'checkbox' :
+        /DatePicker/i.test(cls)    ? 'date'     :
+        /NumericBox/i.test(cls)    ? 'numeric'  : 'text';
+
+      let r: { ok: boolean; reason: string; finalValue?: string };
+      if (widgetType === 'radio')        r = setRadio(node, node.somExpression, strVal, name);
+      else if (widgetType === 'dropdown') r = setDropdown(node, node.somExpression, strVal, name);
+      else {
+        try {
+          gb.setProperty([node.somExpression], 'value', [strVal]);
+          r = { ok: true, reason: 'setProperty', finalValue: strVal };
+        } catch (e) { r = { ok: false, reason: `setProperty threw: ${(e as Error).message}` }; }
+      }
+      if (r.ok) count++;
+      results.push({ name, value: strVal, ok: r.ok, widget: widgetType, reason: r.reason, finalValue: r.finalValue });
     }
-    return count;
+    return { count, results };
   }, Object.entries(overrides));
 }
 
