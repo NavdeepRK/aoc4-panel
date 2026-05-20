@@ -205,6 +205,15 @@ export async function runAoc4Job(job: Aoc4Job, opts: { artifactDir: string; skip
   setPhase(jobId, 'FILLING_PANEL', { panelInProgress: 1 });
   await applyPanel1(page, payload);
   await populateSignatoryTables(page, payload);
+
+  // Apply schema-driven panel1 panelOverrides AFTER the legacy applyPanel1 hardcoded
+  // values, so anything the SPOC entered in the form (e.g. natureS, agm dates) wins.
+  const panel1Overrides = payload.panelOverrides?.panel1;
+  if (panel1Overrides && Object.keys(panel1Overrides).length > 0) {
+    const r = await _applyDirectOverrides(page, panel1Overrides);
+    fs.writeFileSync(path.join(opts.artifactDir, `${jobId}-panel1-overrides.json`), JSON.stringify(r, null, 2));
+    log(`panel1 applied ${r.count}/${Object.keys(panel1Overrides).length} direct overrides`);
+  }
   await page.waitForTimeout(800);
   log('panel1 filled + signatory tables populated');
 
@@ -574,6 +583,22 @@ export async function runAoc4Job(job: Aoc4Job, opts: { artifactDir: string; skip
   } else {
     log('skipPanels2to6=true; stopping at panel 1');
   }
+
+  // ─── PANEL 7 — review / submit panel (no Save button of its own). ────────────
+  // Apply its panelOverrides via setProperty so fields like the CSR + RPT +
+  // product-category radios and the Declaration signer block all land on the
+  // draft even though panel 7 isn't part of the per-panel save loop.
+  const panel7Overrides = payload.panelOverrides?.panel7;
+  if (panel7Overrides && Object.keys(panel7Overrides).length > 0) {
+    try {
+      const r = await _applyDirectOverrides(page, panel7Overrides);
+      fs.writeFileSync(path.join(opts.artifactDir, `${jobId}-panel7-overrides.json`), JSON.stringify(r, null, 2));
+      log(`panel7 applied ${r.count}/${Object.keys(panel7Overrides).length} direct overrides (no save — rolls into final-submit)`);
+    } catch (e) {
+      log(`panel7 overrides threw: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+
   log('Next steps: director/CA opens MCA "My Application", finds this draft, completes panels 2-7, downloads PDF, DSC-signs, submits');
 
   // Try to download the draft PDF if the AEM register fired
