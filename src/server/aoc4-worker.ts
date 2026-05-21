@@ -191,6 +191,29 @@ export async function runAoc4Job(job: Aoc4Job, opts: { artifactDir: string; skip
   await page.waitForTimeout(4500);
   log('prefill complete');
 
+  // ─── Diagnostic: dump radio + dropdown options for panel 1 radios so we can see
+  // the REAL {value, label} mapping in AEM. The legacy worker's '1'=Yes assumption
+  // was demonstrably wrong on the 2026-05-20 PHARMLOGIC run (model accepted '1'
+  // but MCA rendered "Not Applicable"). AEM re-renders the form after prefill which
+  // destroys the page context — retry a few times with increasing waits.
+  for (let attempt = 1; attempt <= 5; attempt++) {
+    try {
+      await page.waitForTimeout(2000 * attempt);
+      const dump = await _dumpRadioOptions(page, [
+        'whetherAnnualGeneralMeeting','wetherProFinancialStatement','whetherAdoptedAdjAGM',
+        'whetherAnyExtension','whetherSchedule3','whetherConsolidated','whetherBooksOfAccount',
+        'WhetherCompanyIsSubsidiary','whetherCompanyHasSubsidiary','categoryOfAuditor',
+        'natureS','industryType','country_Auditor','area_locality_Auditor','InsuranceOrNBFC',
+      ]);
+      fs.writeFileSync(path.join(opts.artifactDir, `${jobId}-radio-options-dump.json`), JSON.stringify(dump, null, 2));
+      log(`radio-options dumped (attempt ${attempt}) — ${dump.length} fields`);
+      break;
+    } catch (e) {
+      log(`radio-options dump attempt ${attempt} threw: ${(e as Error).message?.slice(0, 100)}`);
+      if (attempt === 5) log('radio-options dump failed after 5 attempts — proceeding without dump');
+    }
+  }
+
   // ─── HYBRID SAVE FLOW ───────────────────────────────────────────────────────
   // 1. Bypass gb.validate() so the panel-1 save click actually fires (otherwise AEM's
   //    GLOBAL validate fails on empty mandatory fields in panels 2-7 and the click is
@@ -213,6 +236,26 @@ export async function runAoc4Job(job: Aoc4Job, opts: { artifactDir: string; skip
     const r = await _applyDirectOverrides(page, panel1Overrides);
     fs.writeFileSync(path.join(opts.artifactDir, `${jobId}-panel1-overrides.json`), JSON.stringify(r, null, 2));
     log(`panel1 applied ${r.count}/${Object.keys(panel1Overrides).length} direct overrides`);
+
+    // Diagnostic dump — capture the AEM node options + nearby DOM radios for every
+    // panel1 radio override so we can see the REAL {value, label} mapping when MCA
+    // renders the wrong option. Runs after a settle delay so the page navigation
+    // (post-modal-dismiss) doesn't destroy the execution context.
+    await page.waitForTimeout(1500);
+    try {
+      const radioNames = Object.keys(panel1Overrides).filter(n =>
+        ['whetherAnnualGeneralMeeting','wetherProFinancialStatement','whetherAdoptedAdjAGM',
+         'whetherAnyExtension','whetherSchedule3','whetherConsolidated','whetherBooksOfAccount',
+         'WhetherCompanyIsSubsidiary','whetherCompanyHasSubsidiary','categoryOfAuditor',
+         'natureS','industryType'].includes(n));
+      if (radioNames.length > 0) {
+        const dump = await _dumpRadioOptions(page, radioNames);
+        fs.writeFileSync(path.join(opts.artifactDir, `${jobId}-radio-options-dump.json`), JSON.stringify(dump, null, 2));
+        log(`radio-options dumped (${radioNames.length} fields)`);
+      }
+    } catch (e) {
+      log(`radio-options dump threw: ${e instanceof Error ? e.message : String(e)}`);
+    }
   }
   await page.waitForTimeout(800);
   log('panel1 filled + signatory tables populated');
@@ -1125,6 +1168,86 @@ async function _invokeAemDraftSave(
 }
 
 /**
+ * Diagnostic — dumps the AEM model's option metadata for a list of field names.
+ * Used to discover the actual {value, label} mapping for radios/dropdowns when
+ * setProperty appears to succeed but the form still renders the wrong option
+ * (i.e. the legacy '1' = Yes assumption turned out to be wrong on a live run).
+ */
+async function _dumpRadioOptions(
+  page: import('playwright').Page,
+  fieldNames: string[],
+): Promise<Array<{ name: string; cls?: string; currentValue?: unknown; options?: Array<{ value: unknown; label?: string }>; jsonModelOptions?: unknown; viewElementId?: string; domRadios?: Array<{ value: string; label: string; id: string; name: string }> }>> {
+  return await page.evaluate((names: string[]) => {
+    type GuideNode = {
+      name?: string;
+      somExpression?: string;
+      className?: string;
+      value?: unknown;
+      items?: GuideNode[];
+      options?: Array<{ value: unknown; label?: string }>;
+      jsonModel?: { options?: unknown };
+      _view?: { element?: HTMLElement };
+    };
+    const gb = (window as unknown as { guideBridge: { resolveNode: (s: string) => unknown } }).guideBridge;
+    const root = gb.resolveNode('rootPanel') as GuideNode | null;
+    const findNode = (n: string): GuideNode | null => {
+      let found: GuideNode | null = null;
+      const walk = (k: GuideNode | undefined): void => {
+        if (!k || found) return;
+        if (k.name === n) { found = k; return; }
+        if (Array.isArray(k.items)) for (const c of k.items) walk(c);
+      };
+      walk(root ?? undefined);
+      return found;
+    };
+
+    const out: Array<{ name: string; cls?: string; currentValue?: unknown; options?: Array<{ value: unknown; label?: string }>; jsonModelOptions?: unknown; viewElementId?: string; domRadios?: Array<{ value: string; label: string; id: string; name: string }> }> = [];
+
+    for (const fieldName of names) {
+      const node = findNode(fieldName);
+      const entry: { name: string; cls?: string; currentValue?: unknown; options?: Array<{ value: unknown; label?: string }>; jsonModelOptions?: unknown; viewElementId?: string; domRadios?: Array<{ value: string; label: string; id: string; name: string }> } = { name: fieldName };
+      if (!node) { out.push(entry); continue; }
+      entry.cls = node.className;
+      entry.currentValue = node.value;
+      entry.options = node.options;
+      entry.jsonModelOptions = node.jsonModel?.options;
+      entry.viewElementId = node._view?.element?.id;
+
+      // Walk every radio in the doc, find ones near the field name
+      const fLower = fieldName.toLowerCase();
+      const radios = Array.from(document.querySelectorAll<HTMLInputElement>('input[type="radio"]'));
+      const matched: Array<{ value: string; label: string; id: string; name: string }> = [];
+      for (const r of radios) {
+        let el: HTMLElement | null = r;
+        let near = false;
+        let depth = 0;
+        while (el && depth < 15) {
+          if (el.id && el.id.toLowerCase().includes(fLower)) { near = true; break; }
+          if (el.getAttribute && (el.getAttribute('data-name') ?? '').toLowerCase().includes(fLower)) { near = true; break; }
+          el = el.parentElement; depth++;
+        }
+        if (!near && !((r.name ?? '').toLowerCase().includes(fLower) || (r.id ?? '').toLowerCase().includes(fLower))) continue;
+        let labelText = '';
+        if (r.id) {
+          const lbl = document.querySelector<HTMLLabelElement>(`label[for="${CSS.escape(r.id)}"]`);
+          if (lbl?.textContent) labelText = lbl.textContent.trim();
+        }
+        if (!labelText) {
+          const cl = r.closest('label');
+          if (cl?.textContent) labelText = cl.textContent.trim();
+        }
+        if (!labelText && r.nextSibling?.nodeType === Node.TEXT_NODE) labelText = r.nextSibling.textContent?.trim() ?? '';
+        if (!labelText && r.nextElementSibling?.textContent) labelText = r.nextElementSibling.textContent.trim();
+        matched.push({ value: r.value, label: labelText.slice(0, 40), id: r.id, name: r.name });
+      }
+      entry.domRadios = matched.slice(0, 10);
+      out.push(entry);
+    }
+    return out;
+  }, fieldNames);
+}
+
+/**
  * Apply caller-supplied field-name → value overrides via setProperty.
  *
  * IMPORTANT: AEM radio buttons and dropdowns use option `value` codes that differ
@@ -1182,15 +1305,6 @@ async function _applyDirectOverrides(
      * unstable across panels but the field name always appears as a path segment
      * delimited by `-` or `_`.
      */
-    const elementsForField = (fieldName: string): HTMLElement[] => {
-      const out: HTMLElement[] = [];
-      const re = new RegExp(`(^|[-_/])${fieldName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}([-_/]|$)`);
-      const all = document.querySelectorAll<HTMLElement>('[id]');
-      for (const el of Array.from(all)) {
-        if (re.test(el.id)) out.push(el);
-      }
-      return out;
-    };
 
 
     /**
@@ -1203,54 +1317,76 @@ async function _applyDirectOverrides(
      *   5. Writing the matched radio's `.value` to setProperty AND clicking the input AND firing events
      */
     /**
-     * Yes/No/NA → numeric AEM enum value translation. The legacy worker established
-     * '1' = Yes and '0' = No for binary radios via `apply('whetherAnnualGeneralMeeting', '1')`
-     * and similar calls that demonstrably worked. Tri-state radios use '2' for Not Applicable.
+     * Yes/No/NA → AEM enum value translation.
+     *
+     * 2026-05-21 update: live introspection of MCA AOC-4 (radios-inspect dump showed
+     * 51 radios all with value="on" — meaning the HTML form encoding uses generated
+     * widget names, not the option codes). AEM's GuideBridge model stores radios by
+     * the LITERAL LABEL configured on the option (just like dropdowns: natureS dropdown
+     * has `value="Adopted Financial statements"` matching its display label exactly).
+     *
+     * So we try the LITERAL label FIRST, then '1'/'0' as a fallback for any field that
+     * happens to use numeric enum codes. The legacy worker's '1'=Yes assumption was
+     * wrong for the live form — it accepted '1' as a model value but the form's
+     * option-matcher rejected it and rendered the default ("Not Applicable").
+     *
+     * MCA radio labels use specific casing — note "Not applicable" (lowercase 'a'),
+     * not "Not Applicable". We try both.
      */
     const labelToEnumGuesses = (label: string): string[] => {
       const l = label.trim().toLowerCase();
-      if (l === 'yes')             return ['1', '0', 'Yes'];
-      if (l === 'no')              return ['0', '1', 'No'];
-      if (l === 'not applicable')  return ['2', '3', 'Not Applicable'];
-      if (l === 'individual')      return ['1', '0', 'Individual'];
-      if (l.includes('firm') || l.includes('auditor')) return ['2', '1', label];
+      if (l === 'yes')             return ['Yes', '1', '0'];
+      if (l === 'no')              return ['No', '0', '1'];
+      if (l === 'not applicable')  return ['Not applicable', 'Not Applicable', '2', '3'];
+      if (l === 'individual')      return ['Individual', '1', '0'];
+      if (l.includes('firm') || l.includes('auditor')) return [label, "Auditor's firm", '2', '1'];
       return [label]; // unknown — try as-is
     };
 
-    const setRadio = (_node: GuideNode, som: string, valueLabel: string, fieldName: string): { ok: boolean; reason: string; finalValue?: string } => {
-      // Collect candidate radio inputs by walking every element with an id that contains
-      // the field name (case-insensitive, no path-segment boundary requirement).
-      const fieldLower = fieldName.toLowerCase();
-      const radioSet = new Set<HTMLInputElement>();
-      for (const el of Array.from(document.querySelectorAll<HTMLElement>('[id]'))) {
-        if (el.id.toLowerCase().includes(fieldLower)) {
-          for (const r of Array.from(el.querySelectorAll<HTMLInputElement>('input[type="radio"]'))) {
-            radioSet.add(r);
-          }
-        }
-      }
-      // Also try by name attribute (AEM sometimes uses field name as the radio group name)
-      if (radioSet.size === 0) {
-        for (const r of Array.from(document.querySelectorAll<HTMLInputElement>(`input[type="radio"]`))) {
-          if ((r.name ?? '').toLowerCase().includes(fieldLower) || (r.id ?? '').toLowerCase().includes(fieldLower)) {
-            radioSet.add(r);
-          }
-        }
-      }
-      const radios = Array.from(radioSet);
+    /** Read back the model value after a setProperty. */
+    const readModelValue = (som: string): string | null => {
+      try {
+        const n = gb.resolveNode(som) as { value?: unknown } | null;
+        const v = n?.value;
+        return v == null ? null : String(v);
+      } catch { return null; }
+    };
 
-      // If DOM-click path isn't available, fall back to setProperty with multiple value
-      // encodings. The legacy worker proved that `setProperty(som, '1')` lands cleanly on
-      // the AEM model for these radios even when the DOM isn't rendered yet.
+    const setRadio = (_node: GuideNode, som: string, valueLabel: string, fieldName: string): { ok: boolean; reason: string; finalValue?: string } => {
+      // Strategy 1: walk ALL radio inputs in the document and find the one whose
+      // ancestor element (any depth) has an id containing the field name.
+      const fieldLower = fieldName.toLowerCase();
+      const allRadios = Array.from(document.querySelectorAll<HTMLInputElement>('input[type="radio"]'));
+      const radios: HTMLInputElement[] = [];
+      for (const r of allRadios) {
+        let el: HTMLElement | null = r;
+        let matched = false;
+        while (el) {
+          if (el.id && el.id.toLowerCase().includes(fieldLower)) { matched = true; break; }
+          el = el.parentElement;
+        }
+        if (matched) radios.push(r);
+      }
+      // Strategy 2: by name attribute
+      if (radios.length === 0) {
+        for (const r of allRadios) {
+          if ((r.name ?? '').toLowerCase().includes(fieldLower) || (r.id ?? '').toLowerCase().includes(fieldLower)) {
+            radios.push(r);
+          }
+        }
+      }
+
+      // No DOM radios — fall back to setProperty with verification
       if (radios.length === 0) {
         const guesses = labelToEnumGuesses(valueLabel);
         for (const guess of guesses) {
-          try {
-            gb.setProperty([som], 'value', [guess]);
-            return { ok: true, reason: `setProperty-only (DOM not rendered): "${guess}" for label "${valueLabel}"`, finalValue: guess };
-          } catch { /* try next guess */ }
+          try { gb.setProperty([som], 'value', [guess]); } catch { continue; }
+          const after = readModelValue(som);
+          if (after === guess || (after != null && labelMatches(after, valueLabel))) {
+            return { ok: true, reason: `setProperty-verified: "${guess}" persisted (model="${after}")`, finalValue: guess };
+          }
         }
-        return { ok: false, reason: `no DOM radios + all setProperty guesses failed for "${valueLabel}"` };
+        return { ok: false, reason: `no DOM radios + setProperty rejected all guesses [${labelToEnumGuesses(valueLabel).join(',')}] (model still: ${readModelValue(som)})` };
       }
 
       const collectLabels = (r: HTMLInputElement): string[] => {
@@ -1280,53 +1416,72 @@ async function _applyDirectOverrides(
         const labels = collectLabels(r);
         sampledLabels.push({ idx: i, value: r.value, labels });
         if (labels.some(l => labelMatches(l, valueLabel))) {
-          // Match found
+          // Match found — fire EVERYTHING: setProperty model, set checked, click, all events
           try { gb.setProperty([som], 'value', [r.value]); } catch { /* */ }
+          // Uncheck all siblings in the same radio group first
+          for (const sib of radios) {
+            if (sib !== r && sib.name === r.name) sib.checked = false;
+          }
           r.checked = true;
           try { r.click(); } catch { /* some browsers throw if click is intercepted */ }
           r.dispatchEvent(new Event('input',  { bubbles: true }));
           r.dispatchEvent(new Event('change', { bubbles: true }));
           r.dispatchEvent(new Event('blur',   { bubbles: true }));
-          return { ok: true, reason: `clicked radio[${i}] value="${r.value}" matched "${labels[0] || '?'}"`, finalValue: r.value };
+          // Verify the model accepted it
+          const after = readModelValue(som);
+          if (after === r.value || (after != null && labelMatches(after, valueLabel))) {
+            return { ok: true, reason: `clicked radio[${i}] value="${r.value}" matched "${labels[0] || '?'}", model="${after}"`, finalValue: r.value };
+          }
+          // DOM click didn't stick — try alternate enum values
+          for (const guess of labelToEnumGuesses(valueLabel)) {
+            try { gb.setProperty([som], 'value', [guess]); } catch { continue; }
+            const after2 = readModelValue(som);
+            if (after2 === guess) {
+              return { ok: true, reason: `clicked + setProperty-fallback "${guess}" (after click model was "${after}")`, finalValue: guess };
+            }
+          }
+          return { ok: false, reason: `clicked radio[${i}] but model didn't persist (model="${after}", expected one of ${labelToEnumGuesses(valueLabel).join('|')})` };
         }
       }
-      // Nothing matched. Return diagnostic info so we can fix the schema.
+      // Nothing matched by label. Last-ditch: try setProperty with enum guesses.
+      for (const guess of labelToEnumGuesses(valueLabel)) {
+        try { gb.setProperty([som], 'value', [guess]); } catch { continue; }
+        const after = readModelValue(som);
+        if (after === guess) {
+          return { ok: true, reason: `no label-match radio; setProperty "${guess}" worked (model="${after}")`, finalValue: guess };
+        }
+      }
       return {
         ok: false,
-        reason: `no radio label matched "${valueLabel}". Available: ${JSON.stringify(sampledLabels.map(s => ({ v: s.value, l: s.labels[0]?.trim()?.slice(0, 30) })))}`,
+        reason: `no radio label matched "${valueLabel}" + setProperty rejected. Sampled: ${JSON.stringify(sampledLabels.map(s => ({ v: s.value, l: s.labels[0]?.trim()?.slice(0, 30) })))}, model=${readModelValue(som)}`,
       };
     };
 
     /** Set a dropdown by label-matching its <option> children. */
     const setDropdown = (_node: GuideNode, som: string, valueLabel: string, fieldName: string): { ok: boolean; reason: string; finalValue?: string } => {
-      // Try every container that has the field name in its id, then look for a <select>
+      const fieldLower = fieldName.toLowerCase();
+      // Strategy: walk all <select> elements, find one whose ancestor id includes fieldName
       let select: HTMLSelectElement | null = null;
-      for (const el of elementsForField(fieldName)) {
-        const s = el.querySelector<HTMLSelectElement>('select');
-        if (s) { select = s; break; }
+      for (const s of Array.from(document.querySelectorAll<HTMLSelectElement>('select'))) {
+        let el: HTMLElement | null = s;
+        while (el) {
+          if (el.id && el.id.toLowerCase().includes(fieldLower)) { select = s; break; }
+          el = el.parentElement;
+        }
+        if (select) break;
       }
       if (!select) {
-        select = document.querySelector<HTMLSelectElement>(`select[name*="${fieldName}"]`)
-              ?? document.querySelector<HTMLSelectElement>(`select[id*="${fieldName}"]`);
+        select = document.querySelector<HTMLSelectElement>(`select[name*="${fieldName}" i]`)
+              ?? document.querySelector<HTMLSelectElement>(`select[id*="${fieldName}" i]`);
       }
       if (!select) {
-        // Some AEM dropdowns are rendered as <input> with a custom widget. Try a text input.
-        const inputAsDropdown = elementsForField(fieldName).find(el => el.tagName === 'INPUT') as HTMLInputElement | undefined;
-        if (inputAsDropdown) {
-          try { gb.setProperty([som], 'value', [valueLabel]); } catch { /* */ }
-          inputAsDropdown.value = valueLabel;
-          inputAsDropdown.dispatchEvent(new Event('input',  { bubbles: true }));
-          inputAsDropdown.dispatchEvent(new Event('change', { bubbles: true }));
-          inputAsDropdown.dispatchEvent(new Event('blur',   { bubbles: true }));
-          return { ok: true, reason: `wrote to <input> widget (dropdown-styled): "${valueLabel}"`, finalValue: valueLabel };
+        // Fallback: setProperty with verification
+        try { gb.setProperty([som], 'value', [valueLabel]); } catch { /* */ }
+        const after = readModelValue(som);
+        if (after === valueLabel || (after != null && labelMatches(after, valueLabel))) {
+          return { ok: true, reason: `setProperty-verified: "${valueLabel}" persisted (model="${after}")`, finalValue: valueLabel };
         }
-        // Final fallback: just write the value via setProperty. Works for off-screen dropdowns.
-        try {
-          gb.setProperty([som], 'value', [valueLabel]);
-          return { ok: true, reason: `setProperty-only (DOM not rendered): "${valueLabel}"`, finalValue: valueLabel };
-        } catch (e) {
-          return { ok: false, reason: `no <select>/<input> + setProperty threw: ${(e as Error).message}` };
-        }
+        return { ok: false, reason: `no <select> found + setProperty rejected (model="${after}")` };
       }
 
       let matched: HTMLOptionElement | null = null;
@@ -1562,35 +1717,16 @@ async function applyPanel1(page: import('playwright').Page, payload: import('./j
       const s = findSom(n);
       if (s) gb.setProperty([s], 'value', [v]);
     };
-    // ISO yyyy-MM-dd → DD/MM/YYYY converter for date fields whose AEM widget rejects
-    // the ISO model format and only accepts the user-typed DD/MM/YYYY display format.
-    apply('fromDate', p.financialYearFrom);
-    apply('toDate', p.financialYearTo);
-    apply('textbox1643785189026', p.boardMeetingFsApprovalDate);
-    apply('DateOfBoard', p.boardMeetingReportDate);
-    apply('dateOfSigningOfReports', p.auditorSigningDate);
-
-    // Q4(b)(i) Nature of FS — defaults to 'Adopted Financial statements'
-    apply('natureS', p.natureOfFinancialStatements || 'Adopted Financial statements');
-    // Q4(b)(iii) + 4(b)(iv) + 7(d) — these radios previously worked with '1' (per pre-2026-05-15 runs).
-    // Keep '1' unless payload provides an override. ('Yes'/'No' literals broke the form somehow
-    // — investigating; reverting until we have more data.)
-    apply('wetherProFinancialStatement', p.provisionalFsFiledEarlier || '1');
-    apply('whetherAdoptedAdjAGM', p.adoptedInAdjournedAgm || '1');
-
-    // Q7(a) AGM held — '1' = Yes, '0' = No. User reported the form rejected '1' but earlier
-    // runs successfully saved with '1', so '1' is the working value and the user was looking
-    // at a stale render. Reverting to '1'.
-    apply('whetherAnnualGeneralMeeting', p.agmHeld || (p.agmDate ? '1' : '0'));
-    apply('ifyesDateOfAGM', p.agmDate);
-    apply('dueDateOfAGM', p.agmDueDate);
-    apply('whetherAnyExtension', p.agmExtensionGranted || '1');
-
-    // Q10(b) Schedule III applicable — this WAS being left unset which let the form default to
-    // 'No' and conflict with C&I industry. Setting explicitly. '1' or 'Yes' — we'll know from
-    // the next run which the form accepts.
-    apply('whetherSchedule3', p.scheduleIIIApplicable || '1');
-
+    // NOTE (2026-05-20): The radio writes (whetherAnnualGeneralMeeting, wetherProFinancialStatement,
+    // whetherAdoptedAdjAGM, whetherAnyExtension, whetherSchedule3) have been REMOVED from
+    // this legacy hardcoded path. They corrupted the AEM model: when the payload sent
+    // a literal label like 'Yes'/'No' (from the schema-driven adapter), `setProperty(som, 'Yes')`
+    // wrote an invalid enum value, AEM silently rejected it, and the form defaulted to
+    // 'Not Applicable'. My subsequent panel1 panelOverrides (which run AFTER this function)
+    // would then write '1' but the model was already corrupted. Removing the legacy writes
+    // means the schema-driven panel1 overrides own the radio writes entirely, using setRadio
+    // which clicks the actual DOM input + verifies the model value persisted.
+    // Kept here: the date + dropdown writes that aren't in panel1 panelOverrides yet.
     apply('numberOfMembers', String(p.numberOfMembers));
   }, payload);
 }
