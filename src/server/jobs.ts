@@ -37,16 +37,24 @@ function _stateFilePath(jobId: string): string {
   return path.join(STATE_ROOT, jobId, STATE_FILE);
 }
 
-/** Strip browser handles + persist to disk. Best-effort — failures are logged but not thrown. */
+/** Strip browser + signal handles + persist to disk. Best-effort. */
 function _persistJob(job: Aoc4Job): void {
   try {
-    const { _browser: _b, _page: _p, ...serializable } = job;
+    const { _browser: _b, _page: _p, _signals: _s, ...serializable } = job;
     const dir = path.join(STATE_ROOT, job.jobId);
     if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
     fs.writeFileSync(_stateFilePath(job.jobId), JSON.stringify(serializable, null, 2), 'utf8');
   } catch (e) {
     process.stderr.write(`[jobs] persist failed for ${job.jobId}: ${(e as Error).message}\n`);
   }
+}
+
+/** Build a deferred-promise pair. The worker awaits .promise; the HTTP handler calls .resolve. */
+export function deferred<T>(): { promise: Promise<T>; resolve: (v: T) => void; reject: (e: Error) => void } {
+  let resolve!: (v: T) => void;
+  let reject!: (e: Error) => void;
+  const promise = new Promise<T>((res, rej) => { resolve = res; reject = rej; });
+  return { promise, resolve, reject };
 }
 
 /** Read state.json files from disk on service startup, populating the in-memory map. */
@@ -77,7 +85,13 @@ export function hydrateJobsFromDisk(): { hydrated: number; skipped: number } {
 
 export type Aoc4Phase =
   | 'PENDING'             // job created, browser not yet launched
-  | 'LOGGING_IN'          // re-using or refreshing the MCA session
+  | 'QUEUED'              // job created but waiting for a concurrency slot
+  | 'LOGIN_NEEDED'        // browser launched on MCA login page, awaiting SPOC creds
+  | 'LOGGING_IN_CREDS'    // creds received, submitting username/password
+  | 'OTP_PENDING'         // login form submitted, waiting for SPOC OTP
+  | 'SUBMITTING_OTP'      // OTP received, submitting
+  | 'AUTHENTICATED'       // logged in, about to navigate to AOC-4 form
+  | 'LOGGING_IN'          // re-using or refreshing the MCA session (legacy shared-session path)
   | 'LOADING_FORM'        // form load + bridge connect
   | 'PREFILLING'          // prefillWithCin in flight
   | 'FILLING_PANEL'       // setProperty calls in progress (panel index in `panelInProgress`)
@@ -87,6 +101,8 @@ export type Aoc4Phase =
   | 'AWAITING_SIGNATURE'  // PDF handed off to admin for DSC signing
   | 'UPLOADING_SIGNED'    // signed PDF being pushed to MCA
   | 'FILED'               // MCA accepted the filing, SRN assigned
+  | 'INVALID_CREDS'       // MCA rejected the SPOC's username/password
+  | 'INVALID_OTP'         // MCA rejected the SPOC's OTP
   | 'FAILED';             // unrecoverable error (see `error`)
 
 export interface Aoc4FormPayload {
@@ -266,6 +282,23 @@ export interface Aoc4Job {
   /** Internal: live browser handle. Kept alive across HTTP requests. */
   _browser?: Browser;
   _page?: Page;
+  /**
+   * Internal: deferred-promise signals for the per-job login flow. The worker awaits
+   * these at the LOGIN_NEEDED / OTP_PENDING phases; the /jobs/:id/creds + /jobs/:id/otp
+   * HTTP endpoints resolve them when the SPOC submits the corresponding input.
+   *
+   * Never serialized (function references can't go to disk). Re-created on hydrate
+   * if needed, but a hydrated job past LOGIN_NEEDED would be stale anyway.
+   */
+  _signals?: {
+    creds?: { promise: Promise<{ userId: string; password: string }>; resolve: (v: { userId: string; password: string }) => void; reject: (e: Error) => void };
+    otp?:   { promise: Promise<{ otp: string }>; resolve: (v: { otp: string }) => void; reject: (e: Error) => void };
+  };
+  /** Per-SPOC login record (the user-id only — password is never persisted). Filled
+   *  when the SPOC submits creds. Useful for admin dashboard. */
+  mcaUserId?: string;
+  /** UI-facing email of the SPOC who triggered this job (for admin dashboard). */
+  spocEmail?: string;
 }
 
 const jobs = new Map<string, Aoc4Job>();
@@ -300,9 +333,9 @@ export function setPhase(jobId: string, phase: Aoc4Phase, extra?: Partial<Aoc4Jo
   return j;
 }
 
-/** Public-safe view (strips internal browser handles) for HTTP responses. */
-export function publicView(j: Aoc4Job): Omit<Aoc4Job, '_browser' | '_page'> {
-  const { _browser: _b, _page: _p, ...rest } = j;
+/** Public-safe view (strips internal browser + signal handles) for HTTP responses. */
+export function publicView(j: Aoc4Job): Omit<Aoc4Job, '_browser' | '_page' | '_signals'> {
+  const { _browser: _b, _page: _p, _signals: _s, ...rest } = j;
   return rest;
 }
 

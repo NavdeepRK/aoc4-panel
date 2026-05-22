@@ -42,7 +42,9 @@ import * as path from 'node:path';
 import * as fs from 'node:fs';
 import { launch } from '../browser.js';
 import { AOC4_FORM_URL, waitForBridge } from '../aoc4/bridge.js';
-import { setPhase, type Aoc4Job } from './jobs.js';
+import { setPhase, type Aoc4Job, deferred } from './jobs.js';
+import { submitCredentials, observe } from '../login.js';
+import { URLS, LOGIN } from '../selectors.js';
 
 const SR_ID_REGEX = /\[Id\]\s*=\s*"([0-9A-Z\-]+)"/;
 // Match both 'Submitted By is a required field' and quoted variants like
@@ -65,14 +67,60 @@ const PANEL_SAVE_IDS: Record<string, string | null> = {
   panel7AOC4: null, // final-submit panel — no separate Save button (uses formSubmitConfirmation)
 };
 
-export async function runAoc4Job(job: Aoc4Job, opts: { artifactDir: string; skipPanels2to6?: boolean }): Promise<void> {
+/**
+ * Fill MCA's OTP input and click verify. The OTP page is reached after submitCredentials
+ * succeeds; it has either a single OTP input or 6 separate digit boxes depending on the
+ * AEM version. We try both layouts.
+ */
+async function _fillOtpAndSubmit(page: import('playwright').Page, otp: string): Promise<void> {
+  // Single-input layout — common
+  const singleOtp = page.getByLabel(/one\s*time\s*password|enter\s*otp|verify\s*otp|otp/i).first();
+  if (await singleOtp.count() > 0 && await singleOtp.isVisible().catch(() => false)) {
+    await singleOtp.fill(otp);
+  } else {
+    // 6-digit-box layout: type characters one at a time into visible inputs
+    const inputs = await page.locator('input[maxlength="1"]').all();
+    if (inputs.length >= otp.length) {
+      for (let i = 0; i < otp.length; i++) {
+        await inputs[i].fill(otp[i]);
+      }
+    } else {
+      // Fallback: focus any visible text input and type
+      const fallback = page.locator('input[type="text"], input[type="tel"], input:not([type])').first();
+      await fallback.fill(otp);
+    }
+  }
+
+  // Click a button labeled Verify / Submit / Continue
+  const submitBtn = page.getByRole('button', { name: /verify|submit|continue|proceed|confirm/i }).first();
+  if (await submitBtn.count() > 0) {
+    await submitBtn.click();
+  } else {
+    // Fallback: press Enter on the OTP input
+    await page.keyboard.press('Enter');
+  }
+}
+
+export async function runAoc4Job(job: Aoc4Job, opts: { artifactDir: string; skipPanels2to6?: boolean; usePerJobLogin?: boolean }): Promise<void> {
   const { jobId, payload } = job;
   const log = (msg: string) => process.stdout.write(`[aoc4-worker ${jobId}] ${msg}\n`);
 
+  // ── Per-job login mode (new, default) vs. legacy shared-session mode ─────────
+  // When usePerJobLogin is true (the new flow), the worker:
+  //   1. Launches a FRESH browser (no storage-state.json)
+  //   2. Navigates to MCA login page
+  //   3. Sets phase=LOGIN_NEEDED and awaits SPOC creds via /jobs/:id/creds
+  //   4. Submits creds, sets phase=OTP_PENDING, awaits OTP via /jobs/:id/otp
+  //   5. Verifies login success, sets phase=AUTHENTICATED, proceeds with form fill
+  // When false (legacy), it loads the shared storage-state.json — for backwards
+  // compat with the dev flow until all SPOCs are migrated.
+  const perJobLogin = opts.usePerJobLogin ?? false;
+
   setPhase(jobId, 'LOGGING_IN');
   // Honors HEADLESS env var. For CI/automated runs set HEADLESS=true.
-  const { browser, page } = await launch();
-  // Persist the browser handle on the job for later phases (PDF download, upload signed)
+  // For per-job login mode, skip loading the shared storage-state.json — each SPOC
+  // logs in fresh with their own credentials.
+  const { browser, page } = await launch({ loadSession: !perJobLogin });
   job._browser = browser;
   job._page = page;
 
@@ -83,14 +131,100 @@ export async function runAoc4Job(job: Aoc4Job, opts: { artifactDir: string; skip
   // payload itself isn't subject to esbuild's compile-time transforms).
   await page.addInitScript('window.__name = function(f, n){ return f; };');
 
+  if (perJobLogin) {
+    // ─── Per-SPOC login flow ─────────────────────────────────────────────────
+    log('per-job login: navigating to MCA login page');
+    await page.goto(URLS.LOGIN, { waitUntil: 'domcontentloaded', timeout: 45_000 });
+    await page.waitForSelector(LOGIN.USER_ID, { state: 'visible', timeout: 20_000 }).catch(() => {});
+
+    // Set up the creds + otp signal deferreds so the HTTP endpoints can resolve them.
+    const credsSignal = deferred<{ userId: string; password: string }>();
+    const otpSignal   = deferred<{ otp: string }>();
+    job._signals = { creds: credsSignal, otp: otpSignal };
+
+    setPhase(jobId, 'LOGIN_NEEDED');
+    log('waiting for SPOC credentials via POST /jobs/' + jobId + '/creds (15 min timeout)');
+    const creds = await Promise.race([
+      credsSignal.promise,
+      new Promise<never>((_, rej) => setTimeout(() => rej(new Error('credentials timeout (15 min)')), 15 * 60 * 1000)),
+    ]).catch((e: Error) => { throw e; });
+
+    // Store userId on the job for the admin dashboard (password is never persisted)
+    job.mcaUserId = creds.userId;
+
+    setPhase(jobId, 'LOGGING_IN_CREDS');
+    log(`submitting credentials for userId=${creds.userId}`);
+    await submitCredentials(page, creds);
+
+    // Poll for the next state — could be OTP step, or invalid creds, or already logged in
+    let postLoginObs = await observe(page);
+    for (let i = 0; i < 20 && postLoginObs.step === 'login-form'; i++) {
+      await page.waitForTimeout(500);
+      postLoginObs = await observe(page);
+    }
+
+    if (postLoginObs.step === 'invalid-credentials') {
+      log(`MCA rejected credentials: ${postLoginObs.errorMessage}`);
+      setPhase(jobId, 'INVALID_CREDS', { error: postLoginObs.errorMessage ?? 'MCA rejected credentials' });
+      await browser.close().catch(() => {});
+      return;
+    }
+
+    if (postLoginObs.step === 'captcha') {
+      // Captcha auto-solve runs from the existing login.ts when ANTHROPIC_API_KEY is set;
+      // we wait for the next state up to 30 s.
+      log('captcha detected — waiting for autosolve');
+      for (let i = 0; i < 60 && postLoginObs.step === 'captcha'; i++) {
+        await page.waitForTimeout(500);
+        postLoginObs = await observe(page);
+      }
+    }
+
+    if (postLoginObs.step === 'otp') {
+      setPhase(jobId, 'OTP_PENDING');
+      log('OTP page reached — waiting for SPOC OTP via POST /jobs/' + jobId + '/otp (5 min timeout)');
+      const otpData = await Promise.race([
+        otpSignal.promise,
+        new Promise<never>((_, rej) => setTimeout(() => rej(new Error('OTP timeout (5 min)')), 5 * 60 * 1000)),
+      ]).catch((e: Error) => { throw e; });
+
+      setPhase(jobId, 'SUBMITTING_OTP');
+      log(`submitting OTP (${otpData.otp.length} chars)`);
+      await _fillOtpAndSubmit(page, otpData.otp);
+
+      // Poll for logged-in confirmation
+      let i = 0;
+      while (i < 30) {
+        const obs = await observe(page);
+        if (obs.step === 'logged-in')             { postLoginObs = obs; break; }
+        if (obs.step === 'invalid-credentials')   {
+          log(`MCA rejected OTP: ${obs.errorMessage}`);
+          setPhase(jobId, 'INVALID_OTP', { error: obs.errorMessage ?? 'MCA rejected OTP' });
+          await browser.close().catch(() => {});
+          return;
+        }
+        await page.waitForTimeout(500);
+        i++;
+      }
+    }
+
+    if (postLoginObs.step !== 'logged-in') {
+      const msg = `login did not reach logged-in state (last step: ${postLoginObs.step})`;
+      log(msg);
+      setPhase(jobId, 'FAILED', { error: msg });
+      await browser.close().catch(() => {});
+      return;
+    }
+
+    setPhase(jobId, 'AUTHENTICATED');
+    log('login successful — proceeding to AOC-4 form');
+  }
+
   setPhase(jobId, 'LOADING_FORM');
   await page.goto(AOC4_FORM_URL, { waitUntil: 'domcontentloaded', timeout: 45_000 });
 
-  // ── Session check ─────────────────────────────────────────────────────────────
-  // If storage-state.json is missing or the MCA session has expired, the server
-  // issues a 302 → login page before any JS runs. Detect this early so we get a
-  // clear FAILED message instead of a cryptic waitForBridge timeout 30 s later.
-  {
+  // ── Legacy-mode session check (only relevant when usePerJobLogin=false) ──
+  if (!perJobLogin) {
     const currentUrl = page.url();
     const isLoginPage =
       currentUrl.includes('fologin') ||
@@ -98,8 +232,6 @@ export async function runAoc4Job(job: Aoc4Job, opts: { artifactDir: string; skip
       currentUrl.includes('login.html');
 
     if (!isLoginPage) {
-      // Even if the URL looks right, the page might be an auth-error/redirect
-      // intermediate. Give AEM 3 s to settle and re-check.
       await page.waitForTimeout(3000);
       const settledUrl = page.url();
       if (

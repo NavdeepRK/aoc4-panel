@@ -30,6 +30,45 @@ import { startHeartbeat, stopHeartbeat, pingMca } from './session-heartbeat.js';
 
 const PORT = Number(process.env.MCA_FILING_PORT ?? 8090);
 const ARTIFACT_ROOT = process.env.MCA_FILING_ARTIFACT_DIR ?? './.artifacts/runs';
+const MAX_CONCURRENT_JOBS = Number(process.env.MAX_CONCURRENT_JOBS ?? 5);
+
+/**
+ * Concurrency-limited job queue.
+ *
+ * Each entry in `pending` is { jobId, runner } — a function that returns a Promise.
+ * We track `activeCount`; when it dips below MAX_CONCURRENT_JOBS we drain one
+ * pending entry. The runner itself decrements activeCount when it finishes.
+ */
+const _queue: Array<{ jobId: string; runner: () => Promise<void> }> = [];
+let _activeCount = 0;
+
+function _drainQueue(): void {
+  while (_activeCount < MAX_CONCURRENT_JOBS && _queue.length > 0) {
+    const entry = _queue.shift()!;
+    _activeCount++;
+    process.stdout.write(`[queue] starting ${entry.jobId} (active=${_activeCount}, pending=${_queue.length})\n`);
+    void entry.runner()
+      .catch(() => { /* errors handled by the runner itself */ })
+      .finally(() => {
+        _activeCount--;
+        process.stdout.write(`[queue] finished ${entry.jobId} (active=${_activeCount}, pending=${_queue.length})\n`);
+        _drainQueue();
+      });
+  }
+}
+
+function enqueueJob(jobId: string, runner: () => Promise<void>): void {
+  _queue.push({ jobId, runner });
+  // Reflect queued state in the job phase if the slot isn't immediately available
+  if (_activeCount >= MAX_CONCURRENT_JOBS) {
+    try { setPhase(jobId, 'QUEUED'); } catch { /* */ }
+  }
+  _drainQueue();
+}
+
+export function queueStats(): { active: number; pending: number; max: number } {
+  return { active: _activeCount, pending: _queue.length, max: MAX_CONCURRENT_JOBS };
+}
 
 function nowIso(): string {
   return new Date().toISOString();
@@ -183,10 +222,13 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (pathname === '/start-aoc4' && method === 'POST') {
-      // ── Session pre-flight ──────────────────────────────────────────────
-      // Make a real HTTP request to MCA with the stored cookies to verify the session
-      // is actually valid — not just checking cookie timestamps which can lie.
-      {
+      const rawPayload = await readJson<Aoc4FormPayload & { _perJobLogin?: boolean; _spocEmail?: string }>(req);
+      // Per-job-login mode: the SPOC will POST their own MCA creds + OTP. Skip the
+      // shared-session pre-flight check entirely.
+      const perJobLogin = rawPayload._perJobLogin === true;
+
+      if (!perJobLogin) {
+        // ── Legacy shared-session pre-flight ──────────────────────────────────
         const ssPath = './storage-state.json';
         if (!fs.existsSync(ssPath)) {
           return send(res, 401, { error: 'MCA session not found. Run `npm run login` first, then retry.' });
@@ -200,16 +242,6 @@ const server = http.createServer(async (req, res) => {
           if (mcaCookies.length === 0) {
             return send(res, 401, { error: 'No MCA cookies found. Run `npm run login` first, then retry.' });
           }
-          const cookieHeader = mcaCookies
-            .filter(c => c.expires === -1 || c.expires > now)
-            .map(c => `${c.name}=${c.value}`)
-            .join('; ');
-          if (!cookieHeader) {
-            return send(res, 401, { error: 'MCA session expired (all cookies past expiry). Run `npm run login` to refresh.' });
-          }
-          // Check that the two auth cookies (sessionID + session-token-md5) are present and
-          // have at least 5 minutes left. MCA CDN blocks raw HTTP probes so we can't do a
-          // live network check without a full browser.
           const authNames = ['sessionID', 'session-token-md5'];
           const validAuthCookies = mcaCookies.filter(c =>
             authNames.includes(c.name) && (c.expires === -1 || c.expires > now + 300),
@@ -220,28 +252,64 @@ const server = http.createServer(async (req, res) => {
         } catch { /* parse error — allow through, worker will surface it */ }
       }
 
-      const payload = await readJson<Aoc4FormPayload>(req);
-      const err = validatePayload(payload);
+      const { _perJobLogin: _p, _spocEmail: spocEmail, ...payload } = rawPayload;
+      const err = validatePayload(payload as Aoc4FormPayload);
       if (err) return send(res, 400, { error: err });
 
       const jobId = `aoc4-${Date.now().toString(36)}-${crypto.randomBytes(3).toString('hex')}`;
-      const job = createJob(jobId, payload);
+      const job = createJob(jobId, payload as Aoc4FormPayload);
+      if (spocEmail) job.spocEmail = spocEmail;
       const artifactDir = path.join(ARTIFACT_ROOT, jobId);
       fs.mkdirSync(artifactDir, { recursive: true });
 
-      // Kick off the worker. Run in background — return job_id immediately so the caller can poll.
-      process.stdout.write(`[server] job ${jobId} started — CIN ${payload.cin}\n`);
-      void runAoc4Job(job, { artifactDir })
-        .then(() => {
+      process.stdout.write(`[server] job ${jobId} created — CIN ${payload.cin}${perJobLogin ? ' (per-job login)' : ''}\n`);
+      enqueueJob(jobId, async () => {
+        try {
+          await runAoc4Job(job, { artifactDir, usePerJobLogin: perJobLogin });
           process.stdout.write(`[server] job ${jobId} completed — phase: ${job.phase}\n`);
-        })
-        .catch((e: unknown) => {
+        } catch (e) {
           const msg = e instanceof Error ? e.message : String(e);
           process.stderr.write(`[server] job ${jobId} THREW: ${msg}\n`);
-          try { setPhase(jobId, 'FAILED', { error: msg }); } catch { /* job may already be gone */ }
-        });
+          try { setPhase(jobId, 'FAILED', { error: msg }); } catch { /* */ }
+        }
+      });
 
-      return send(res, 202, { job_id: jobId, phase: job.phase, createdAt: nowIso() });
+      return send(res, 202, { job_id: jobId, phase: job.phase, createdAt: nowIso(), queue: queueStats() });
+    }
+
+    // ── Per-job login endpoints (Phase 2 of the per-SPOC login feature) ──────
+    let mAuth = pathname.match(/^\/jobs\/([^/]+)\/creds$/);
+    if (mAuth && method === 'POST') {
+      const job = getJob(mAuth[1]);
+      if (!job) return send(res, 404, { error: 'job not found' });
+      if (job.phase !== 'LOGIN_NEEDED') {
+        return send(res, 409, { error: `job is in phase ${job.phase}, not LOGIN_NEEDED` });
+      }
+      const body = await readJson<{ userId?: string; password?: string }>(req);
+      if (!body?.userId || !body?.password) {
+        return send(res, 400, { error: 'body must be { userId, password }' });
+      }
+      if (!job._signals?.creds) {
+        return send(res, 500, { error: 'job has no pending creds signal — internal state mismatch' });
+      }
+      job._signals.creds.resolve({ userId: body.userId, password: body.password });
+      return send(res, 202, { ok: true, phase: job.phase });
+    }
+
+    mAuth = pathname.match(/^\/jobs\/([^/]+)\/otp$/);
+    if (mAuth && method === 'POST') {
+      const job = getJob(mAuth[1]);
+      if (!job) return send(res, 404, { error: 'job not found' });
+      if (job.phase !== 'OTP_PENDING') {
+        return send(res, 409, { error: `job is in phase ${job.phase}, not OTP_PENDING` });
+      }
+      const body = await readJson<{ otp?: string }>(req);
+      if (!body?.otp) return send(res, 400, { error: 'body must be { otp }' });
+      if (!job._signals?.otp) {
+        return send(res, 500, { error: 'job has no pending otp signal — internal state mismatch' });
+      }
+      job._signals.otp.resolve({ otp: body.otp });
+      return send(res, 202, { ok: true, phase: job.phase });
     }
 
     let m = pathname.match(/^\/jobs\/([^/]+)\/status$/);
