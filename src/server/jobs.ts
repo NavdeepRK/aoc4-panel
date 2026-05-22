@@ -240,6 +240,22 @@ export interface Aoc4FormPayload {
    *  panelOverrides mappings (visible in worker logs for coverage tracking). */
   _aemMappingStats?: { mapped: number; unmappedAem: number };
 
+  /**
+   * Per-aemField widget metadata. Sent by the adapter for every override so the
+   * worker can click radios/dropdowns by their visible label rather than writing
+   * AEM option-key strings via setProperty (which AEM's model accepts but the
+   * save-time validator rejects — confirmed in PHARMLOGIC run 2026-05-22).
+   *
+   * Shape:  `{ [aemFieldName]: { widget, questionLabel, optionLabel } }`
+   *   widget        : 'radio' | 'dropdown' | 'text' | 'date' | ...
+   *   questionLabel : the human-readable MCA question text used to locate the
+   *                   widget on the page (e.g. "Whether annual general meeting
+   *                   (AGM) held")
+   *   optionLabel   : the desired option text for radio/dropdown widgets
+   *                   (e.g. "Yes", "No", "Auditor's firm")
+   */
+  _fieldMeta?: Record<string, { widget: string; questionLabel: string; optionLabel?: string }>;
+
   /** Saved Playwright storageState from a prior login for this SPOC. When present,
    *  the worker tries the cookies first and skips the LOGIN_NEEDED/OTP_PENDING
    *  prompts. If MCA rejects them (session expired), falls back to fresh login. */

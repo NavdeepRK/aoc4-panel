@@ -468,7 +468,7 @@ export async function runAoc4Job(job: Aoc4Job, opts: { artifactDir: string; skip
   // values, so anything the SPOC entered in the form (e.g. natureS, agm dates) wins.
   const panel1Overrides = payload.panelOverrides?.panel1;
   if (panel1Overrides && Object.keys(panel1Overrides).length > 0) {
-    const r = await _applyDirectOverrides(page, panel1Overrides);
+    const r = await _applyDirectOverrides(page, panel1Overrides, payload._fieldMeta);
     fs.writeFileSync(path.join(opts.artifactDir, `${jobId}-panel1-overrides.json`), JSON.stringify(r, null, 2));
     log(`panel1 applied ${r.count}/${Object.keys(panel1Overrides).length} direct overrides`);
 
@@ -828,7 +828,7 @@ export async function runAoc4Job(job: Aoc4Job, opts: { artifactDir: string; skip
       const shortKey = `panel${panelNum}` as 'panel1' | 'panel2' | 'panel3' | 'panel4' | 'panel5' | 'panel6' | 'panel7';
       const overrides = payload.panelOverrides?.[shortKey];
       if (overrides && Object.keys(overrides).length > 0) {
-        const overrideResult = await _applyDirectOverrides(page, overrides);
+        const overrideResult = await _applyDirectOverrides(page, overrides, payload._fieldMeta);
         fs.writeFileSync(
           path.join(opts.artifactDir, `${jobId}-panel${panelNum}-overrides.json`),
           JSON.stringify(overrideResult, null, 2),
@@ -869,7 +869,7 @@ export async function runAoc4Job(job: Aoc4Job, opts: { artifactDir: string; skip
   const panel7Overrides = payload.panelOverrides?.panel7;
   if (panel7Overrides && Object.keys(panel7Overrides).length > 0) {
     try {
-      const r = await _applyDirectOverrides(page, panel7Overrides);
+      const r = await _applyDirectOverrides(page, panel7Overrides, payload._fieldMeta);
       fs.writeFileSync(path.join(opts.artifactDir, `${jobId}-panel7-overrides.json`), JSON.stringify(r, null, 2));
       log(`panel7 applied ${r.count}/${Object.keys(panel7Overrides).length} direct overrides (no save — rolls into final-submit)`);
     } catch (e) {
@@ -1499,11 +1499,135 @@ async function _dumpRadioOptions(
  *
  * Returns count of overrides successfully written.
  */
+/**
+ * Click an AEM radio button or dropdown by its visible question text + option label.
+ *
+ * Uses Playwright locators (not page.evaluate) so we get auto-retry + locator
+ * stability across iframe re-renders. AEM Forms radios have HTML `value="on"`
+ * placeholders + internal AEM-managed option keys — writing the label string
+ * via setProperty puts the right value in the model but fails the save-time
+ * validator (saw "Please select a valid option" on PHARMLOGIC 2026-05-22).
+ * Clicking the input fires AEM's onclick handler which sets the right key.
+ *
+ * Strategy:
+ *   1. Find the question text on the page via getByText (partial match — first
+ *      ~40 chars of the schema label, with regex-meta stripped)
+ *   2. Walk up to a common ancestor that contains both the question and its
+ *      radio group / select
+ *   3. Within that ancestor, find the label that matches the desired option
+ *      text + click its associated <input>
+ *
+ * Returns { ok, reason } for the artifact.
+ */
+async function _clickWidgetByLabel(
+  page: import('playwright').Page,
+  questionLabel: string,
+  optionLabel: string,
+  widget: 'radio' | 'dropdown',
+): Promise<{ ok: boolean; reason: string }> {
+  // Take only enough of the question to disambiguate, escape regex meta.
+  const qText = questionLabel.replace(/^\s*\*\s*/, '').replace(/[()*?+|.^$\\[\]{}]/g, '').trim().slice(0, 50);
+  if (!qText) return { ok: false, reason: 'empty question text' };
+
+  try {
+    // Find the question text. Use a partial match — `i` flag, `exact:false`.
+    const question = page.locator(`text=/${qText.replace(/\s+/g, '\\s+')}/i`).first();
+    const found = await question.count();
+    if (found === 0) {
+      return { ok: false, reason: `question text "${qText}" not found on page` };
+    }
+
+    // Walk up the DOM to find the field's container — typically 2-5 ancestors up
+    // we hit a div that contains both the label and the input group.
+    if (widget === 'radio') {
+      // The radio's user-facing label is in a <label> or <span> element. Find
+      // the closest one matching the option text within a reasonable proximity
+      // of the question.
+      //
+      // Use xpath: from the question text, go up to find an ancestor div, then
+      // look for a descendant input[type=radio] whose adjacent label text matches.
+      const optionRegex = new RegExp(`^\\s*${optionLabel.replace(/[()*?+|.^$\\[\]{}]/g, '\\$&')}\\s*$`, 'i');
+      const radio = question
+        .locator('xpath=ancestor::*[self::div or self::tr or self::td or self::form][1]')
+        .locator('input[type="radio"]')
+        .filter({
+          has: page.locator(`xpath=following-sibling::label[1] | xpath=parent::label`).filter({ hasText: optionRegex }),
+        })
+        .first();
+
+      // Simpler fallback: just match by adjacent label text within the same ancestor div.
+      const fallback = question
+        .locator('xpath=ancestor::*[self::div or self::tr or self::td or self::form][1]')
+        .locator('label')
+        .filter({ hasText: optionRegex })
+        .first();
+
+      // Try radio input direct click first; if it doesn't work, click the label
+      if (await radio.count() > 0) {
+        await radio.scrollIntoViewIfNeeded({ timeout: 3000 }).catch(() => {});
+        await radio.click({ timeout: 5000, force: true });
+        return { ok: true, reason: `clicked radio input adjacent to label "${optionLabel}"` };
+      }
+      if (await fallback.count() > 0) {
+        await fallback.scrollIntoViewIfNeeded({ timeout: 3000 }).catch(() => {});
+        await fallback.click({ timeout: 5000, force: true });
+        return { ok: true, reason: `clicked <label> with text "${optionLabel}"` };
+      }
+      return { ok: false, reason: `no <label> matching "${optionLabel}" near question "${qText}"` };
+    }
+
+    // Dropdown: find the <select> within the same ancestor, set its value by matching
+    // an <option> whose text matches the desired label.
+    if (widget === 'dropdown') {
+      const select = question
+        .locator('xpath=ancestor::*[self::div or self::tr or self::td or self::form][1]')
+        .locator('select')
+        .first();
+      if (await select.count() === 0) {
+        return { ok: false, reason: `no <select> near question "${qText}"` };
+      }
+      await select.scrollIntoViewIfNeeded({ timeout: 3000 }).catch(() => {});
+      await select.selectOption({ label: optionLabel }, { timeout: 5000 });
+      return { ok: true, reason: `selected option "${optionLabel}"` };
+    }
+
+    return { ok: false, reason: `unknown widget type ${widget}` };
+  } catch (e) {
+    return { ok: false, reason: `locator click threw: ${(e as Error).message.slice(0, 120)}` };
+  }
+}
+
 async function _applyDirectOverrides(
   page: import('playwright').Page,
   overrides: Record<string, string | number>,
+  fieldMeta?: Record<string, { widget: string; questionLabel: string; optionLabel?: string }>,
 ): Promise<{ count: number; results: Array<{ name: string; value: string; ok: boolean; widget: string; reason: string; finalValue?: string }> }> {
-  return await page.evaluate((entries) => {
+  // ─── Pass A: radios + dropdowns via Playwright locator clicks ─────────────
+  // Only runs for entries where fieldMeta tells us the widget type + question
+  // label. setProperty doesn't work for these (model accepts the label string
+  // but MCA's save validator rejects it). Clicking the actual DOM input fires
+  // AEM's onclick handler which writes the correct internal option key.
+  const passAResults: Array<{ name: string; value: string; ok: boolean; widget: string; reason: string; finalValue?: string }> = [];
+  const handledByLocator = new Set<string>();
+  if (fieldMeta) {
+    for (const [name, value] of Object.entries(overrides)) {
+      const meta = fieldMeta[name];
+      if (!meta) continue;
+      if (meta.widget !== 'radio' && meta.widget !== 'dropdown') continue;
+      const r = await _clickWidgetByLabel(page, meta.questionLabel, String(value), meta.widget);
+      passAResults.push({ name, value: String(value), ok: r.ok, widget: meta.widget, reason: r.reason, finalValue: r.ok ? String(value) : undefined });
+      handledByLocator.add(name);
+      // Tiny pause between clicks so AEM has time to render conditional fields
+      // (e.g. 7(a) Yes → shows 7(b) date picker) before we try the next override.
+      await page.waitForTimeout(200);
+    }
+  }
+
+  // Filter the remaining overrides for Pass B (setProperty path)
+  const remaining: Array<[string, string | number]> = Object.entries(overrides).filter(([n]) => !handledByLocator.has(n));
+
+  // ─── Pass B: setProperty for text/date/number/etc. ────────────────────────
+  const passBResult = await page.evaluate((entries) => {
     type GuideNode = {
       name?: string;
       somExpression?: string;
@@ -1765,7 +1889,13 @@ async function _applyDirectOverrides(
       results.push({ name, value: strVal, ok: r.ok, widget: widgetType, reason: r.reason, finalValue: r.finalValue });
     }
     return { count, results };
-  }, Object.entries(overrides));
+  }, remaining);
+
+  // Merge Pass A + Pass B results
+  return {
+    count: passAResults.filter(x => x.ok).length + passBResult.count,
+    results: [...passAResults, ...passBResult.results],
+  };
 }
 
 /**
