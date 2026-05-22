@@ -24,6 +24,11 @@ services:
       ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"    # optional, for captcha auto-solve
       MCA_FILING_PORT: "8090"
       MCA_FILING_ARTIFACT_DIR: "/app/.artifacts/runs"
+      # Saved-session save-back: when set, worker POSTs new storageState back to
+      # the customer-portal-backend after a successful per-SPOC login so the next
+      # ⚡ for that SPOC skips the login form.
+      PORTAL_BACKEND_URL: "${PORTAL_BACKEND_URL:-}"
+      SYSTEM_AUTH_TOKEN: "${SYSTEM_AUTH_TOKEN:-}"
       # Per-job-login mode does NOT need MCA_USER_ID/MCA_PASSWORD — each SPOC sends
       # their own creds via /jobs/:id/creds. Those env vars are only used by `npm run
       # login` which is a dev helper to create storage-state.json for shared-session

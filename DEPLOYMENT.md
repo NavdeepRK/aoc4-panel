@@ -161,6 +161,76 @@ Production: `HEADLESS=true` (default in Dockerfile). For debugging on the VPS, e
 | Browser memory leaks | Stale jobs not cleaned up | Check `MAX_CONCURRENT_JOBS` not too high; add `JOB_IDLE_TIMEOUT_MS` cleanup (TODO) |
 | `INVALID_CREDS` on every job | MCA changed login flow | Re-run the live introspector + update `src/selectors.ts` |
 
+## AWS deployment
+
+Three viable patterns, in order of simplicity:
+
+### Option A — EC2 + Docker (recommended)
+
+The simplest and cheapest. One Ubuntu EC2 box running docker compose.
+
+| Concurrent jobs | Instance type | Monthly (approx, on-demand) |
+|---|---|---|
+| 5 | t3.large (8 GB / 2 vCPU) | ~$60 |
+| 10 | t3.xlarge (16 GB / 4 vCPU) | ~$120 |
+| 20 | t3.2xlarge (32 GB / 8 vCPU) | ~$240 |
+
+```bash
+# After launching the EC2 with Ubuntu 22.04, SSH in:
+sudo apt-get update && sudo apt-get install -y nginx
+curl -fsSL https://get.docker.com | sh
+sudo usermod -aG docker ubuntu
+git clone <repo> mca-filing-service && cd mca-filing-service
+cp .env.example .env && nano .env       # set ADMIN_TOKEN, MCA_SESSION_ENC_KEY, etc.
+docker compose up -d --build
+
+# Then configure nginx + Let's Encrypt as per the section above.
+```
+
+**Security group**: allow 22 (your IP only), 80 + 443 (0.0.0.0/0), block 8090.
+
+### Option B — ECS Fargate
+
+Managed container, no SSH, auto-scaling. Best if you have an ECS cluster already.
+
+Caveats:
+- Each Playwright Chromium needs ≥4 GB ephemeral storage — set `ephemeralStorage: { sizeInGiB: 50 }` in the task definition.
+- Use a Fargate service with `MIN/MAX` capacity = the number of concurrent jobs you want.
+- Artifacts: mount an EFS volume at `/app/.artifacts` so jobs survive task restarts.
+- Health check via the ALB target group hits `/health`.
+
+```jsonc
+// task definition snippet
+{
+  "containerDefinitions": [{
+    "name": "mca-filing-service",
+    "image": "<ecr-repo>/mca-filing-service:latest",
+    "cpu": 2048,
+    "memory": 4096,
+    "environment": [
+      { "name": "MAX_CONCURRENT_JOBS", "value": "5" },
+      { "name": "HEADLESS", "value": "true" }
+    ],
+    "secrets": [
+      { "name": "ADMIN_TOKEN",            "valueFrom": "arn:aws:ssm:...:parameter/mca/admin_token" },
+      { "name": "SYSTEM_AUTH_TOKEN",      "valueFrom": "arn:aws:ssm:...:parameter/mca/system_token" },
+      { "name": "MCA_SESSION_ENC_KEY",    "valueFrom": "arn:aws:ssm:...:parameter/mca/session_enc_key" },
+      { "name": "PORTAL_BACKEND_URL",     "valueFrom": "arn:aws:ssm:...:parameter/mca/portal_url" }
+    ],
+    "portMappings": [{ "containerPort": 8090 }],
+    "ephemeralStorage": { "sizeInGiB": 50 }
+  }]
+}
+```
+
+### Option C — Elastic Beanstalk (Docker platform)
+
+Easiest if you don't want to manage anything. Upload the repo as a `Dockerrun.aws.json` or use the multi-container option. Same env vars as above.
+
+### Recommendation
+
+Start with **Option A (EC2 + docker compose)** unless you have specific reasons to use ECS. It's cheaper, easier to debug (you can `docker compose logs -f` over SSH), and the Playwright Chromium overhead is the same.
+
 ## Security checklist
 
 - [ ] Bind worker port to `127.0.0.1` (not 0.0.0.0)

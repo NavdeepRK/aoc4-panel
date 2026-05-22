@@ -8,6 +8,9 @@ export interface LaunchOptions {
   storageStatePath?: string;
   /** When true, attempt to load storage-state.json even if it exists. Default: true. */
   loadSession?: boolean;
+  /** Inline storage state (Playwright's storageState format). Takes precedence over
+   *  storageStatePath when present — used by the per-SPOC saved-session feature. */
+  storageState?: { cookies?: unknown[]; origins?: unknown[] };
 }
 
 const env = (k: string, d?: string) => process.env[k] ?? d;
@@ -46,7 +49,12 @@ export async function launch(opts: LaunchOptions = {}): Promise<{ browser: Brows
     userAgent:
       'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
   };
-  if (loadSession && storagePath && fs.existsSync(storagePath)) {
+  // Priority: inline storageState (per-SPOC saved session) > shared storage-state.json
+  if (opts.storageState) {
+    // Playwright accepts the storage-state object directly.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (contextOptions as { storageState?: unknown }).storageState = opts.storageState as any;
+  } else if (loadSession && storagePath && fs.existsSync(storagePath)) {
     contextOptions.storageState = storagePath;
   }
   const context = await browser.newContext(contextOptions);

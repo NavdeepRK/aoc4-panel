@@ -68,6 +68,50 @@ const PANEL_SAVE_IDS: Record<string, string | null> = {
 };
 
 /**
+ * After a successful per-SPOC login, post the captured Playwright storageState back
+ * to the customer-portal-backend so the next ⚡ for this SPOC can skip the login flow.
+ *
+ * Endpoint:  POST {PORTAL_BACKEND_URL}/api/compliance/system/mca-session/:userId
+ * Auth:      X-System-Token header set to env SYSTEM_AUTH_TOKEN
+ *
+ * Silently no-ops if SYSTEM_AUTH_TOKEN or PORTAL_BACKEND_URL is not configured —
+ * the filing continues without saving the session (SPOC just has to log in again
+ * next time).
+ */
+async function _postStorageStateBack(
+  spocUserId: string,
+  mcaUserId: string,
+  storageState: { cookies?: unknown[]; origins?: unknown[] },
+  log: (m: string) => void,
+): Promise<void> {
+  const backendUrl = process.env.PORTAL_BACKEND_URL;
+  const token = process.env.SYSTEM_AUTH_TOKEN;
+  if (!backendUrl || !token) {
+    log('storageState save-back skipped — PORTAL_BACKEND_URL or SYSTEM_AUTH_TOKEN not set');
+    return;
+  }
+  const url = `${backendUrl.replace(/\/$/, '')}/api/compliance/system/mca-session/${encodeURIComponent(spocUserId)}`;
+  try {
+    const resp = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-system-token': token,
+      },
+      body: JSON.stringify({ mcaUserId, storageState }),
+    });
+    if (!resp.ok) {
+      const txt = await resp.text().catch(() => '');
+      log(`storageState save-back HTTP ${resp.status}: ${txt.slice(0, 200)}`);
+      return;
+    }
+    log(`storageState save-back ok — session reusable for SPOC ${spocUserId} (mcaUserId=${mcaUserId})`);
+  } catch (e) {
+    log(`storageState save-back threw: ${(e as Error).message}`);
+  }
+}
+
+/**
  * Fill MCA's OTP input and click verify. The OTP page is reached after submitCredentials
  * succeeds; it has either a single OTP input or 6 separate digit boxes depending on the
  * AEM version. We try both layouts.
@@ -118,9 +162,16 @@ export async function runAoc4Job(job: Aoc4Job, opts: { artifactDir: string; skip
 
   setPhase(jobId, 'LOGGING_IN');
   // Honors HEADLESS env var. For CI/automated runs set HEADLESS=true.
-  // For per-job login mode, skip loading the shared storage-state.json — each SPOC
-  // logs in fresh with their own credentials.
-  const { browser, page } = await launch({ loadSession: !perJobLogin });
+  //
+  // Browser startup options:
+  //   - Per-job mode WITHOUT saved session: fresh context, SPOC will log in
+  //   - Per-job mode WITH saved session: load the per-SPOC storageState (skip login)
+  //   - Legacy mode: load shared storage-state.json from disk
+  const savedStorageState = payload._storageState;
+  const { browser, page } = await launch({
+    loadSession: !perJobLogin,
+    storageState: perJobLogin && savedStorageState ? savedStorageState : undefined,
+  });
   job._browser = browser;
   job._page = page;
 
@@ -132,7 +183,30 @@ export async function runAoc4Job(job: Aoc4Job, opts: { artifactDir: string; skip
   await page.addInitScript('window.__name = function(f, n){ return f; };');
 
   if (perJobLogin) {
-    // ─── Per-SPOC login flow ─────────────────────────────────────────────────
+    // ─── Saved-session fast path ─────────────────────────────────────────────
+    // If the SPOC has a saved MCA storage state, try opening the form directly.
+    // If MCA accepts the cookies, we skip the login entirely. If we get redirected
+    // to login, fall through to the fresh-login flow below.
+    let usedSavedSession = false;
+    if (savedStorageState) {
+      log(`saved MCA session available (mcaUserId=${payload._savedMcaUserId ?? '?'}) — trying directly`);
+      await page.goto(AOC4_FORM_URL, { waitUntil: 'domcontentloaded', timeout: 45_000 });
+      await page.waitForTimeout(2500);
+      const url = page.url();
+      const onLogin = /fologin|\/login|login\.html/i.test(url);
+      if (!onLogin) {
+        log('saved session valid — proceeding without login');
+        setPhase(jobId, 'AUTHENTICATED');
+        usedSavedSession = true;
+      } else {
+        log('saved session expired (redirected to login) — falling through to fresh login');
+      }
+    }
+
+    if (usedSavedSession) {
+      // Skip ahead — main form-fill flow takes over below at LOADING_FORM
+    } else {
+    // ─── Fresh per-SPOC login flow ───────────────────────────────────────────
     log('per-job login: navigating to MCA login page');
     await page.goto(URLS.LOGIN, { waitUntil: 'domcontentloaded', timeout: 45_000 });
     await page.waitForSelector(LOGIN.USER_ID, { state: 'visible', timeout: 20_000 }).catch(() => {});
@@ -218,6 +292,20 @@ export async function runAoc4Job(job: Aoc4Job, opts: { artifactDir: string; skip
 
     setPhase(jobId, 'AUTHENTICATED');
     log('login successful — proceeding to AOC-4 form');
+
+    // ─── Capture + persist the new storage state for this SPOC ──────────────
+    // Posts to the customer-portal-backend's /system/mca-session/:userId endpoint
+    // which encrypts at rest. The SPOC's NEXT trigger will reuse this and skip
+    // the login flow entirely (until MCA's session cookies expire ~3h later).
+    if (payload._spocUserId) {
+      try {
+        const newStorageState = await page.context().storageState();
+        await _postStorageStateBack(payload._spocUserId, creds.userId, newStorageState, log);
+      } catch (e) {
+        log(`failed to capture/post storageState: ${e instanceof Error ? e.message : String(e)}`);
+      }
+    }
+    } // close the `else { fresh per-SPOC login flow ... }` block
   }
 
   setPhase(jobId, 'LOADING_FORM');

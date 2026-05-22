@@ -239,6 +239,17 @@ export interface Aoc4FormPayload {
   /** Debug stats from the adapter — how many schema fields actually got
    *  panelOverrides mappings (visible in worker logs for coverage tracking). */
   _aemMappingStats?: { mapped: number; unmappedAem: number };
+
+  /** Saved Playwright storageState from a prior login for this SPOC. When present,
+   *  the worker tries the cookies first and skips the LOGIN_NEEDED/OTP_PENDING
+   *  prompts. If MCA rejects them (session expired), falls back to fresh login. */
+  _storageState?: { cookies?: unknown[]; origins?: unknown[] };
+  /** The MCA user id this stored session was captured for — used for admin dashboard
+   *  display + sanity check. */
+  _savedMcaUserId?: string;
+  /** Portal user id — needed by the worker to POST the new storageState back to the
+   *  backend after a successful login. */
+  _spocUserId?: string | null;
 }
 
 export interface Aoc4Job {
