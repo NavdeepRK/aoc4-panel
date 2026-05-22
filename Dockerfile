@@ -14,6 +14,13 @@
 
 FROM mcr.microsoft.com/playwright:v1.50.0-jammy AS base
 
+# poppler-utils provides `pdftotext` used by the backend's FS-PDF parser. The
+# worker itself doesn't need it (yet), but installing here keeps a single image
+# usable for both the worker container AND any future "parse-on-the-worker" mode.
+USER root
+RUN apt-get update && apt-get install -y --no-install-recommends poppler-utils \
+    && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
 
 # Copy package manifests first for better layer caching
