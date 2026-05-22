@@ -44,6 +44,7 @@ import { launch } from '../browser.js';
 import { AOC4_FORM_URL, waitForBridge } from '../aoc4/bridge.js';
 import { setPhase, type Aoc4Job, deferred } from './jobs.js';
 import { submitCredentials, observe } from '../login.js';
+import { autoSolveCaptcha } from '../captcha.js';
 import { URLS, LOGIN } from '../selectors.js';
 
 const SR_ID_REGEX = /\[Id\]\s*=\s*"([0-9A-Z\-]+)"/;
@@ -244,14 +245,28 @@ export async function runAoc4Job(job: Aoc4Job, opts: { artifactDir: string; skip
       return;
     }
 
+    // Captcha loop — try up to 3 times: each attempt calls autoSolveCaptcha
+    // (which uses OPENROUTER_API_KEY / TrueCaptcha if configured), polls for
+    // next state, retries if MCA throws a fresh captcha back.
+    let captchaAttempts = 0;
+    while (postLoginObs.step === 'captcha' && captchaAttempts < 3) {
+      captchaAttempts++;
+      log(`captcha detected (attempt ${captchaAttempts}/3) — invoking autoSolveCaptcha`);
+      const result = await autoSolveCaptcha(page, { maxAttempts: 3 }).catch((e: Error) => ({
+        ok: false as const, error: e.message, attempts: 0,
+      }));
+      log(`autoSolveCaptcha returned: ${JSON.stringify(result)}`);
+      // Give MCA time to validate the submitted captcha + transition
+      await page.waitForTimeout(2000);
+      postLoginObs = await observe(page);
+      // If still captcha, MCA rejected the solve — loop will retry with a fresh image
+    }
+
     if (postLoginObs.step === 'captcha') {
-      // Captcha auto-solve runs from the existing login.ts when ANTHROPIC_API_KEY is set;
-      // we wait for the next state up to 30 s.
-      log('captcha detected — waiting for autosolve');
-      for (let i = 0; i < 60 && postLoginObs.step === 'captcha'; i++) {
-        await page.waitForTimeout(500);
-        postLoginObs = await observe(page);
-      }
+      log('captcha unsolved after 3 attempts');
+      setPhase(jobId, 'FAILED', { error: 'Captcha auto-solve failed — set OPENROUTER_API_KEY in worker .env, or solve manually in the headed browser' });
+      await browser.close().catch(() => {});
+      return;
     }
 
     if (postLoginObs.step === 'otp') {
