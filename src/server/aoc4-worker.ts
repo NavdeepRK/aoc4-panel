@@ -113,6 +113,40 @@ async function _postStorageStateBack(
 }
 
 /**
+ * MCA sometimes shows a "This account is already logged in somewhere else.
+ * Do you want to continue?" dialog right after credentials are accepted (and
+ * occasionally during OTP flow). Auto-click Yes/Continue so the worker doesn't
+ * stall waiting for human intervention — the original session gets booted,
+ * which is what the SPOC presumably wants since they're re-logging in.
+ *
+ * Returns true if a popup was found + dismissed.
+ */
+async function _dismissAlreadyLoggedInPopup(page: import('playwright').Page): Promise<boolean> {
+  try {
+    // The dialog text varies slightly. Match on the recognisable phrase.
+    const dialog = page.locator('text=/already\\s*logged\\s*in/i').first();
+    if (await dialog.count() === 0) return false;
+    // Find a Yes/Continue/OK button reasonably near the message
+    const yesBtn = page
+      .getByRole('button', { name: /^(yes|continue|ok|proceed|confirm)$/i })
+      .first();
+    if (await yesBtn.count() > 0) {
+      await yesBtn.click({ timeout: 3000, force: true });
+      return true;
+    }
+    // Fallback: any visible <button>/<a> with that text inside a modal-ish container
+    const fallback = page.locator('button, a, input[type="button"], input[type="submit"]')
+      .filter({ hasText: /^\s*(yes|continue|ok|proceed|confirm)\s*$/i })
+      .first();
+    if (await fallback.count() > 0) {
+      await fallback.click({ timeout: 3000, force: true });
+      return true;
+    }
+  } catch { /* swallow — best-effort */ }
+  return false;
+}
+
+/**
  * Fill MCA's OTP input and click verify. The OTP page is reached after submitCredentials
  * succeeds; it has either a single OTP input or 6 separate digit boxes depending on the
  * AEM version. We try both layouts.
@@ -231,9 +265,13 @@ export async function runAoc4Job(job: Aoc4Job, opts: { artifactDir: string; skip
     log(`submitting credentials for userId=${creds.userId}`);
     await submitCredentials(page, creds);
 
-    // Poll for the next state — could be OTP step, or invalid creds, or already logged in
+    // Poll for the next state — could be OTP step, invalid creds, captcha,
+    // OR the "already logged in elsewhere" interstitial. Auto-dismiss the
+    // latter on every iteration so the worker doesn't stall.
     let postLoginObs = await observe(page);
-    for (let i = 0; i < 20 && postLoginObs.step === 'login-form'; i++) {
+    for (let i = 0; i < 30 && (postLoginObs.step === 'login-form' || postLoginObs.step === 'unknown'); i++) {
+      const dismissed = await _dismissAlreadyLoggedInPopup(page);
+      if (dismissed) log('dismissed "already logged in elsewhere" popup');
       await page.waitForTimeout(500);
       postLoginObs = await observe(page);
     }
@@ -271,29 +309,68 @@ export async function runAoc4Job(job: Aoc4Job, opts: { artifactDir: string; skip
 
     if (postLoginObs.step === 'otp') {
       setPhase(jobId, 'OTP_PENDING');
-      log('OTP page reached — waiting for SPOC OTP via POST /jobs/' + jobId + '/otp (5 min timeout)');
-      const otpData = await Promise.race([
-        otpSignal.promise,
-        new Promise<never>((_, rej) => setTimeout(() => rej(new Error('OTP timeout (5 min)')), 5 * 60 * 1000)),
-      ]).catch((e: Error) => { throw e; });
+      log('OTP page reached — waiting for SPOC OTP via POST /jobs/' + jobId + '/otp OR direct browser entry (5 min timeout)');
 
-      setPhase(jobId, 'SUBMITTING_OTP');
-      log(`submitting OTP (${otpData.otp.length} chars)`);
-      await _fillOtpAndSubmit(page, otpData.otp);
+      // Race three outcomes (whichever happens first wins):
+      //   1. SPOC POSTed OTP to /jobs/:id/otp  → worker fills it via Playwright
+      //   2. SPOC typed OTP directly in the browser tab (production won't allow
+      //      this since SPOCs don't see the headless browser, but in dev/headed
+      //      mode this is convenient — observe() detects the logged-in state)
+      //   3. 5-minute timeout → FAILED
+      //
+      // We also auto-dismiss the "already logged in" popup mid-OTP since MCA
+      // sometimes shows it on the OTP page too.
+      const OTP_TIMEOUT_MS = 5 * 60 * 1000;
+      const otpStart = Date.now();
+      let otpFilled = false;
+      let observedLoggedIn = false;
 
-      // Poll for logged-in confirmation
-      let i = 0;
-      while (i < 30) {
+      while (Date.now() - otpStart < OTP_TIMEOUT_MS) {
+        // Always try to dismiss the popup first
+        await _dismissAlreadyLoggedInPopup(page).catch(() => {});
+
+        // Did the API receive an OTP?
+        if (!otpFilled) {
+          // Non-blocking check: if the signal already resolved, fill it; otherwise move on
+          const otpData = await Promise.race([
+            otpSignal.promise.then(d => ({ resolved: true as const, data: d })),
+            new Promise<{ resolved: false }>(r => setTimeout(() => r({ resolved: false }), 200)),
+          ]);
+          if (otpData.resolved) {
+            setPhase(jobId, 'SUBMITTING_OTP');
+            log(`SPOC POSTed OTP via API (${otpData.data.otp.length} chars) — filling`);
+            await _fillOtpAndSubmit(page, otpData.data.otp);
+            otpFilled = true;
+          }
+        }
+
+        // Check the browser state regardless — SPOC may have typed OTP in the
+        // browser tab directly (dev/headed mode), or our fill above may have
+        // succeeded and AEM transitioned.
         const obs = await observe(page);
-        if (obs.step === 'logged-in')             { postLoginObs = obs; break; }
-        if (obs.step === 'invalid-credentials')   {
+        if (obs.step === 'logged-in') {
+          observedLoggedIn = true;
+          postLoginObs = obs;
+          if (!otpFilled) log('login completed in browser (OTP not received via API — assuming SPOC typed in headed browser)');
+          break;
+        }
+        if (obs.step === 'invalid-credentials') {
           log(`MCA rejected OTP: ${obs.errorMessage}`);
           setPhase(jobId, 'INVALID_OTP', { error: obs.errorMessage ?? 'MCA rejected OTP' });
           await browser.close().catch(() => {});
           return;
         }
-        await page.waitForTimeout(500);
-        i++;
+        await page.waitForTimeout(700);
+      }
+
+      if (!observedLoggedIn) {
+        const msg = otpFilled
+          ? 'OTP was submitted but MCA never confirmed logged-in state within 5 min'
+          : 'OTP timeout (5 min) — SPOC never submitted OTP via the portal prompt';
+        log(msg);
+        setPhase(jobId, 'FAILED', { error: msg });
+        await browser.close().catch(() => {});
+        return;
       }
     }
 
