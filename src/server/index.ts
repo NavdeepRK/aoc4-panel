@@ -135,6 +135,47 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, { ok: true, service: 'mca-filing-service', time: nowIso() });
     }
 
+    // ── /admin — minimal ops dashboard (HTML + JSON) ──────────────────────────
+    // Basic auth via ADMIN_TOKEN env var. If unset, dashboard is wide-open (dev only).
+    if (pathname === '/admin' && method === 'GET') {
+      const token = process.env.ADMIN_TOKEN;
+      const provided = url.searchParams.get('token');
+      if (token && provided !== token) {
+        return send(res, 401, { error: 'admin token required: ?token=<value>' });
+      }
+      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+      res.end(_ADMIN_HTML);
+      return;
+    }
+    if (pathname === '/admin/api/jobs' && method === 'GET') {
+      const token = process.env.ADMIN_TOKEN;
+      const provided = url.searchParams.get('token') ?? (req.headers['authorization'] ?? '').replace(/^Bearer\s+/, '');
+      if (token && provided !== token) return send(res, 401, { error: 'unauthorized' });
+
+      const all = listJobs().map(publicView);
+      const q = queueStats();
+      const now = Date.now();
+      const phaseCounts: Record<string, number> = {};
+      let activeCount = 0;
+      for (const j of all) {
+        phaseCounts[j.phase] = (phaseCounts[j.phase] ?? 0) + 1;
+        if (now - j.lastEventAt < 30 * 60 * 1000 && !/FILED|FAILED|INVALID/.test(j.phase)) activeCount++;
+      }
+      // Sort most-recent first
+      all.sort((a, b) => b.createdAt - a.createdAt);
+      const totals = {
+        total: all.length,
+        active: activeCount,
+        today: all.filter(j => now - j.createdAt < 24 * 60 * 60 * 1000).length,
+        succeeded: phaseCounts['FILED'] ?? 0,
+        draftsCreated: (phaseCounts['DRAFT_CREATED'] ?? 0) + (phaseCounts['PDF_DOWNLOADED'] ?? 0),
+        failed: (phaseCounts['FAILED'] ?? 0) + (phaseCounts['INVALID_CREDS'] ?? 0) + (phaseCounts['INVALID_OTP'] ?? 0),
+        awaitingLogin: phaseCounts['LOGIN_NEEDED'] ?? 0,
+        awaitingOtp:   phaseCounts['OTP_PENDING'] ?? 0,
+      };
+      return send(res, 200, { totals, phaseCounts, queue: q, jobs: all.slice(0, 100) });
+    }
+
     // GET /check-session — verifies MCA login by making a real HTTP request with stored cookies.
     // Does NOT launch a browser. Uses Node's built-in https to hit an MCA endpoint that returns
     // 200 only for authenticated users (redirects to login page for anonymous requests).
@@ -430,3 +471,96 @@ const shutdown = async (sig: string): Promise<void> => {
 };
 process.on('SIGTERM', () => void shutdown('SIGTERM'));
 process.on('SIGINT', () => void shutdown('SIGINT'));
+
+/**
+ * Minimal admin dashboard. Self-contained HTML + vanilla JS that polls
+ * /admin/api/jobs every 5s. Renders totals + the recent jobs table.
+ */
+const _ADMIN_HTML = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>mca-filing-service — ops dashboard</title>
+<style>
+  *{box-sizing:border-box}
+  body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;margin:0;padding:24px;background:#0f172a;color:#e2e8f0}
+  h1{font-size:18px;margin:0 0 16px;font-weight:600}
+  h2{font-size:14px;margin:24px 0 8px;color:#94a3b8;text-transform:uppercase;letter-spacing:0.05em}
+  .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:16px}
+  .stat{background:#1e293b;padding:12px 16px;border-radius:8px;border:1px solid #334155}
+  .stat-label{font-size:11px;color:#94a3b8;text-transform:uppercase;letter-spacing:0.05em}
+  .stat-value{font-size:22px;font-weight:600;margin-top:4px}
+  .stat.warn .stat-value{color:#fbbf24}
+  .stat.err .stat-value{color:#f87171}
+  .stat.ok .stat-value{color:#34d399}
+  table{width:100%;border-collapse:collapse;font-size:12px}
+  th,td{padding:8px 10px;text-align:left;border-bottom:1px solid #334155}
+  th{font-weight:500;color:#94a3b8;background:#1e293b;position:sticky;top:0}
+  tr:hover{background:#1e293b}
+  .phase{display:inline-block;padding:2px 8px;border-radius:4px;font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:0.05em}
+  .phase-LOGIN_NEEDED,.phase-OTP_PENDING,.phase-QUEUED{background:#fef3c7;color:#92400e}
+  .phase-FILLING_PANEL,.phase-SAVING_PANEL,.phase-LOADING_FORM,.phase-PREFILLING,.phase-LOGGING_IN_CREDS,.phase-SUBMITTING_OTP,.phase-AUTHENTICATED{background:#dbeafe;color:#1e40af}
+  .phase-DRAFT_CREATED,.phase-PDF_DOWNLOADED,.phase-FILED{background:#d1fae5;color:#065f46}
+  .phase-FAILED,.phase-INVALID_CREDS,.phase-INVALID_OTP{background:#fee2e2;color:#991b1b}
+  .mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px}
+  .muted{color:#64748b}
+  .err-text{color:#f87171;font-size:11px;max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  #refreshNote{font-size:11px;color:#64748b;float:right}
+</style>
+</head>
+<body>
+<h1>mca-filing-service <span class="muted" style="font-size:12px;font-weight:400">— ops dashboard</span> <span id="refreshNote"></span></h1>
+<div class="stats" id="stats"></div>
+<h2>Recent jobs (latest 100)</h2>
+<div style="max-height:60vh;overflow:auto;background:#1e293b;border-radius:8px;border:1px solid #334155">
+  <table id="jobs">
+    <thead>
+      <tr><th>Created</th><th>Job</th><th>CIN</th><th>SPOC</th><th>MCA User</th><th>Phase</th><th>Panels</th><th>Error</th></tr>
+    </thead>
+    <tbody></tbody>
+  </table>
+</div>
+<script>
+const TOKEN = new URLSearchParams(location.search).get('token') || '';
+async function refresh() {
+  try {
+    const r = await fetch('/admin/api/jobs' + (TOKEN ? '?token=' + encodeURIComponent(TOKEN) : ''));
+    if (!r.ok) { document.getElementById('refreshNote').textContent = 'unauthorized'; return; }
+    const d = await r.json();
+    const t = d.totals;
+    const q = d.queue;
+    document.getElementById('stats').innerHTML = [
+      ['Active', t.active, ''],
+      ['Today', t.today, ''],
+      ['Drafts', t.draftsCreated, 'ok'],
+      ['Filed', t.succeeded, 'ok'],
+      ['Awaiting login', t.awaitingLogin, t.awaitingLogin > 0 ? 'warn' : ''],
+      ['Awaiting OTP', t.awaitingOtp, t.awaitingOtp > 0 ? 'warn' : ''],
+      ['Failed', t.failed, t.failed > 0 ? 'err' : ''],
+      ['Queue', q.active + '/' + q.max + (q.pending ? ' (+' + q.pending + ')' : ''), ''],
+    ].map(([l, v, cls]) => '<div class="stat ' + cls + '"><div class="stat-label">' + l + '</div><div class="stat-value">' + v + '</div></div>').join('');
+    const tbody = document.querySelector('#jobs tbody');
+    tbody.innerHTML = d.jobs.map(j => {
+      const created = new Date(j.createdAt).toLocaleString('en-IN', { hour12: false });
+      const panels = (j.panelResults || []).map(p => p.ok ? '<span style="color:#34d399">' + p.panel + '</span>' : '<span style="color:#f87171">' + p.panel + '</span>').join(' ');
+      return '<tr>' +
+        '<td class="mono muted">' + created + '</td>' +
+        '<td class="mono">' + j.jobId.slice(-12) + '</td>' +
+        '<td class="mono">' + (j.cin || '') + '</td>' +
+        '<td>' + (j.spocEmail || '<span class="muted">-</span>') + '</td>' +
+        '<td class="mono">' + (j.mcaUserId || '<span class="muted">-</span>') + '</td>' +
+        '<td><span class="phase phase-' + j.phase + '">' + j.phase + '</span></td>' +
+        '<td>' + panels + '</td>' +
+        '<td class="err-text">' + (j.error || '') + '</td>' +
+      '</tr>';
+    }).join('');
+    document.getElementById('refreshNote').textContent = 'updated ' + new Date().toLocaleTimeString('en-IN', { hour12: false });
+  } catch (e) {
+    document.getElementById('refreshNote').textContent = 'err: ' + e.message;
+  }
+}
+refresh();
+setInterval(refresh, 5000);
+</script>
+</body>
+</html>`;

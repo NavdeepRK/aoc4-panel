@@ -1,0 +1,45 @@
+version: '3.8'
+
+# docker-compose for mca-filing-service.
+#
+# Local dev / single-host production:
+#   docker compose up -d
+#   docker compose logs -f
+#
+# Update:
+#   docker compose pull && docker compose up -d --force-recreate
+
+services:
+  mca-filing-service:
+    build: .
+    image: mca-filing-service:latest
+    container_name: mca-filing-service
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8090:8090"   # bind to localhost only; reverse-proxy in front
+    environment:
+      HEADLESS: "true"
+      MAX_CONCURRENT_JOBS: "5"
+      ADMIN_TOKEN: "${ADMIN_TOKEN:-changeme}"
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"    # optional, for captcha auto-solve
+      MCA_FILING_PORT: "8090"
+      MCA_FILING_ARTIFACT_DIR: "/app/.artifacts/runs"
+      # Per-job-login mode does NOT need MCA_USER_ID/MCA_PASSWORD — each SPOC sends
+      # their own creds via /jobs/:id/creds. Those env vars are only used by `npm run
+      # login` which is a dev helper to create storage-state.json for shared-session
+      # mode.
+    volumes:
+      - ./artifacts:/app/.artifacts        # job state + per-panel JSON + draft PDFs
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8090/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    # Resource limits — tune to the VPS:
+    #   1 GB RAM ≈ ~3 concurrent browsers, 2 GB ≈ ~5, 4 GB ≈ ~10
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+          cpus: "2.0"
