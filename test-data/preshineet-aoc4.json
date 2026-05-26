@@ -1,0 +1,56 @@
+{
+  "_meta": {
+    "entity": "PRESHINEET SOFTWARE SOLUTIONS (OPC) PRIVATE LIMITED",
+    "cin": "U62099KA2024OPC186699",
+    "pan": "AAOCP6051D",
+    "source": "Real filed AOC-4 SRN 1-22487002396 (FY 2024-2025)",
+    "_note": "inc20AFlag=N on MCA — save will be blocked until the logged-in account is board-authorized for this CIN. Automation will still load, prefill, and fill all panels — useful for UI verification up to the Save step."
+  },
+  "cin": "U62099KA2024OPC186699",
+  "financialYearFrom": "2024-03-27",
+  "financialYearTo": "2025-03-31",
+  "boardMeetingFsApprovalDate": "2025-11-29",
+  "boardMeetingReportDate": "2025-11-29",
+  "auditorSigningDate": "2025-11-29",
+  "agmDate": "2025-11-25",
+  "agmDueDate": "2025-12-31",
+  "numberOfMembers": 1,
+  "directors": [
+    {
+      "din": "10565678",
+      "designation": "Director"
+    }
+  ],
+  "fsSignerDirectorIndex": 0,
+  "auditor": {
+    "srnOfAdt1": "Z99999999",
+    "pan": "BNDPG0028F",
+    "category": "Individual",
+    "membershipNumber": "557898",
+    "name": "Manoj Gupta",
+    "address": {
+      "line1": "H.No. 110, 50 FEET ROAD RAILWAY COLONY SHERPUR KALAN NEAR SWARN PALACE FOCAL POINT",
+      "country": "India",
+      "pincode": "141010",
+      "city": "Ludhiana",
+      "district": "Ludhiana",
+      "state": "Punjab"
+    }
+  },
+  "scheduleIII": {
+    "equityShareCapital":     { "current": 5000,    "previous": 0 },
+    "otherEquity":            { "current": -105360, "previous": 0 },
+    "longTermBorrowings":     { "current": 308500,  "previous": 0 },
+    "shortTermBorrowings":    { "current": 0,       "previous": 0 },
+    "tradePayables":          { "current": 0,       "previous": 0 },
+    "cashAndCashEquivalents": { "current": 171100,  "previous": 0 }
+  },
+  "profitAndLoss": {
+    "revenueFromOperations": { "current": 3002330, "previous": 0 },
+    "otherIncome":           { "current": 0,       "previous": 0 },
+    "totalRevenue":          { "current": 3002330, "previous": 0 },
+    "totalExpenses":         { "current": 3144710, "previous": 0 },
+    "profitBeforeTax":       { "current": -142380, "previous": 0 },
+    "profitAfterTax":        { "current": -105360, "previous": 0 }
+  }
+}

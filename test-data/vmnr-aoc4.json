@@ -1,0 +1,50 @@
+{
+  "_meta": {
+    "entity": "VMNR GLOBAL TECH PRIVATE LIMITED",
+    "cin": "U46522HR2023PTC116130"
+  },
+  "cin": "U46522HR2023PTC116130",
+  "financialYearFrom": "2023-10-30",
+  "financialYearTo": "2024-03-31",
+  "boardMeetingFsApprovalDate": "2024-06-20",
+  "boardMeetingReportDate": "2024-06-20",
+  "auditorSigningDate": "2024-06-20",
+  "agmDate": "2024-06-24",
+  "agmDueDate": "2024-12-31",
+  "numberOfMembers": 2,
+  "directors": [
+    { "din": "08755915", "designation": "Director" }
+  ],
+  "fsSignerDirectorIndex": 0,
+  "auditor": {
+    "srnOfAdt1": "Z99999999",
+    "pan": "BNDPG0028F",
+    "category": "Individual",
+    "membershipNumber": "557898",
+    "name": "Manoj Gupta",
+    "address": {
+      "line1": "H.No. 110, 50 FEET ROAD RAILWAY COLONY SHERPUR KALAN",
+      "country": "India",
+      "pincode": "141010",
+      "city": "Ludhiana",
+      "district": "Ludhiana",
+      "state": "Punjab"
+    }
+  },
+  "scheduleIII": {
+    "equityShareCapital":     { "current": 10000, "previous": 0 },
+    "otherEquity":            { "current": 0,     "previous": 0 },
+    "longTermBorrowings":     { "current": 0,     "previous": 0 },
+    "shortTermBorrowings":    { "current": 0,     "previous": 0 },
+    "tradePayables":          { "current": 0,     "previous": 0 },
+    "cashAndCashEquivalents": { "current": 10000, "previous": 0 }
+  },
+  "profitAndLoss": {
+    "revenueFromOperations": { "current": 0, "previous": 0 },
+    "otherIncome":           { "current": 0, "previous": 0 },
+    "totalRevenue":          { "current": 0, "previous": 0 },
+    "totalExpenses":         { "current": 0, "previous": 0 },
+    "profitBeforeTax":       { "current": 0, "previous": 0 },
+    "profitAfterTax":        { "current": 0, "previous": 0 }
+  }
+}

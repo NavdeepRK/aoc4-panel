@@ -43,22 +43,28 @@ export async function observe(page: Page): Promise<LoginObservation> {
     return { step: 'captcha', url };
   }
 
-  const otpVisible = await page
-    .getByText(/one\s*time\s*password|enter\s*otp|verify\s*otp/i)
-    .first()
-    .isVisible()
-    .catch(() => false);
-  if (otpVisible) return { step: 'otp', url };
-
+  // Check for an inline error BEFORE the OTP-page check. When MCA rejects an
+  // OTP, the OTP form stays visible with an inline error like "Invalid OTP" /
+  // "Wrong OTP" — if we checked OTP first, observe() would return step='otp'
+  // and the worker would never escalate the error, leaving the UI spinning at
+  // SUBMITTING_OTP. The text filter is specific enough (invalid/incorrect/
+  // wrong/etc) that it won't false-positive on a clean OTP page.
   const errorMsg = await page
     .locator('.guideFieldError, .guideMessage--error, [class*="error"]:not([class*="captcha"])')
-    .filter({ hasText: /invalid|incorrect|wrong|locked|disabled|not\s*registered/i })
+    .filter({ hasText: /invalid|incorrect|wrong|locked|disabled|not\s*registered|expired|mismatch/i })
     .first()
     .textContent()
     .catch(() => null);
   if (errorMsg && errorMsg.trim()) {
     return { step: 'invalid-credentials', url, errorMessage: errorMsg.trim() };
   }
+
+  const otpVisible = await page
+    .getByText(/one\s*time\s*password|enter\s*otp|verify\s*otp/i)
+    .first()
+    .isVisible()
+    .catch(() => false);
+  if (otpVisible) return { step: 'otp', url };
 
   // Logged-in markers, in priority order:
   //   1. URL contains /application-history — original confident signal

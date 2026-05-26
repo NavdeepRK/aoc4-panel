@@ -1,0 +1,58 @@
+{
+  "_meta": {
+    "entity": "SAFE LEDGER PRIVATE LIMITED",
+    "cin": "U74999KA2021PTC147303",
+    "fy": "2023-24",
+    "directors": [
+      { "din": "11027716", "name": "Srihari Ramachandra Dhondalay" },
+      { "din": "11017985", "name": "Sidharth Ravichandran" },
+      { "din": "11020797", "name": "Joel Lester Dsouza" }
+    ]
+  },
+  "cin": "U74999KA2021PTC147303",
+  "financialYearFrom": "2023-04-01",
+  "financialYearTo": "2024-03-31",
+  "boardMeetingFsApprovalDate": "2024-09-20",
+  "boardMeetingReportDate": "2024-09-20",
+  "auditorSigningDate": "2024-09-20",
+  "agmDate": "2024-09-28",
+  "agmDueDate": "2024-09-30",
+  "numberOfMembers": 3,
+  "directors": [
+    { "din": "11027716", "designation": "Director" },
+    { "din": "11017985", "designation": "Director" },
+    { "din": "11020797", "designation": "Director" }
+  ],
+  "fsSignerDirectorIndex": 0,
+  "auditor": {
+    "srnOfAdt1": "Z99999999",
+    "pan": "BNDPG0028F",
+    "category": "Individual",
+    "membershipNumber": "557898",
+    "name": "Manoj Gupta",
+    "address": {
+      "line1": "H.No. 110, 50 FEET ROAD RAILWAY COLONY SHERPUR KALAN",
+      "country": "India",
+      "pincode": "141010",
+      "city": "Ludhiana",
+      "district": "Ludhiana",
+      "state": "Punjab"
+    }
+  },
+  "scheduleIII": {
+    "equityShareCapital":     { "current": 9000,  "previous": 9000 },
+    "otherEquity":            { "current": 0,     "previous": 0 },
+    "longTermBorrowings":     { "current": 0,     "previous": 0 },
+    "shortTermBorrowings":    { "current": 0,     "previous": 0 },
+    "tradePayables":          { "current": 0,     "previous": 0 },
+    "cashAndCashEquivalents": { "current": 9000,  "previous": 9000 }
+  },
+  "profitAndLoss": {
+    "revenueFromOperations": { "current": 0, "previous": 0 },
+    "otherIncome":           { "current": 0, "previous": 0 },
+    "totalRevenue":          { "current": 0, "previous": 0 },
+    "totalExpenses":         { "current": 0, "previous": 0 },
+    "profitBeforeTax":       { "current": 0, "previous": 0 },
+    "profitAfterTax":        { "current": 0, "previous": 0 }
+  }
+}

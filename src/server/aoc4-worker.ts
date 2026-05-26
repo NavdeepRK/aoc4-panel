@@ -1602,13 +1602,26 @@ async function _clickWidgetByLabel(
   optionLabel: string,
   widget: 'radio' | 'dropdown',
 ): Promise<{ ok: boolean; reason: string }> {
-  // Take only enough of the question to disambiguate, escape regex meta.
-  const qText = questionLabel.replace(/^\s*\*\s*/, '').replace(/[()*?+|.^$\\[\]{}]/g, '').trim().slice(0, 50);
+  // Strip leading "*" (MCA's required marker) and a leading numeric prefix like
+  // "7 (a) " / "9(e)(i) " so the search is robust to MCA's exact paren/spacing.
+  // Then take a stable middle slice as the disambiguator. We escape ALL regex
+  // metacharacters and only allow whitespace flexibility, so the regex matches
+  // the literal label (parens included) on the page.
+  const cleanLabel = questionLabel
+    .replace(/^\s*\*\s*/, '')
+    .replace(/^\s*\d+\s*[(\[]?\s*[a-z]\s*[)\]]?(?:\s*[(\[]?\s*[ivx]+\s*[)\]]?)?\s*\*?\s*/i, '')
+    .trim();
+  const qText = cleanLabel.slice(0, 60);
   if (!qText) return { ok: false, reason: 'empty question text' };
+
+  // Escape every regex meta char, then allow \s+ between original whitespace runs.
+  const escaped = qText
+    .replace(/[\\^$.*+?()[\]{}|]/g, '\\$&')
+    .replace(/\s+/g, '\\s+');
 
   try {
     // Find the question text. Use a partial match — `i` flag, `exact:false`.
-    const question = page.locator(`text=/${qText.replace(/\s+/g, '\\s+')}/i`).first();
+    const question = page.locator(`text=/${escaped}/i`).first();
     const found = await question.count();
     if (found === 0) {
       return { ok: false, reason: `question text "${qText}" not found on page` };
