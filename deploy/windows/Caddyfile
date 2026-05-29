@@ -1,0 +1,45 @@
+# Caddyfile for mca-filing-service -- public HTTPS reverse proxy.
+#
+# Fronts the Node worker (127.0.0.1:8090) with automatic Let's Encrypt TLS and an
+# IP allowlist so only the customer-portal backend can reach the job endpoints.
+# The worker's /start-aoc4 and /jobs/* endpoints have NO bearer auth, so this IP
+# allowlist is the access control -- keep it tight.
+#
+# SETUP:
+#   1. Replace WORKER_DOMAIN with the public hostname that resolves (DNS A record)
+#      to this box's Elastic IP, e.g. mca-filing.registerkaro.in
+#   2. Replace BACKEND_IP with the customer-portal backend's PUBLIC EGRESS IP.
+#      Add more `client_ip` entries (space-separated) for any extra allowed callers.
+#   3. Replace admin@registerkaro.in with a real address for Let's Encrypt notices.
+#   4. Run via NSSM:  .\deploy\windows\install-caddy-service.ps1
+#
+# NOTE: Let's Encrypt validation needs ports 80 + 443 reachable from the internet
+# (open them in the Windows firewall + EC2 Security Group). The allowlist below
+# still 403s anyone other than BACKEND_IP at the application layer, so opening
+# 80/443 for ACME does not expose the worker.
+
+{
+	email admin@registerkaro.in
+}
+
+WORKER_DOMAIN {
+	# --- access control: only the backend may reach the worker ---------------
+	@allowed client_ip BACKEND_IP
+	handle @allowed {
+		reverse_proxy 127.0.0.1:8090 {
+			header_up Host {host}
+			header_up X-Real-IP {remote_host}
+			header_up X-Forwarded-For {remote_host}
+			# form fills can take several minutes
+			transport http {
+				read_timeout 600s
+				write_timeout 600s
+			}
+		}
+	}
+
+	# everyone else
+	handle {
+		respond "forbidden" 403
+	}
+}
