@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-  Configure a *visible, watchable* headed Chromium run that survives reboots.
+  Configure a visible, watchable headed Chromium run that survives reboots.
 
 .DESCRIPTION
   WHY NOT A SERVICE?  A Windows Service runs in Session 0, which has no desktop on
@@ -8,15 +8,15 @@
   To let a human watch/intervene in the browser, the process must run in an
   INTERACTIVE session. The reliable pattern:
 
-    1. Autologon  — on boot the box logs into an interactive desktop (Session 1)
+    1. Autologon  - on boot the box logs into an interactive desktop (Session 1)
                     as a dedicated user, with no human at the keyboard.
-    2. Keep-awake — disable screensaver / lock / sleep so the desktop stays live.
-    3. Scheduled task (At log on, "run only when user is logged on") — starts the
+    2. Keep-awake - disable screensaver / lock / sleep so the desktop stays live.
+    3. Scheduled task (At log on, "run only when user is logged on") - starts the
        server in that interactive session, so Chromium windows are visible over RDP
-       (use /admin console session or "Show session" RDP) and auto-restarts on crash.
+       (use a console session) and auto-restarts on crash.
 
   This script does (2) + (3). It does NOT set the autologon password into the
-  registry for you (storing a plaintext password is a security risk) — instead it
+  registry for you (storing a plaintext password is a security risk) - instead it
   prints the recommended Sysinternals Autologon step for (1), which stores the
   secret encrypted in the LSA.
 
@@ -45,7 +45,7 @@ $envFile = Join-Path $RepoRoot '.env'
 if (Test-Path $envFile) {
   $headless = Select-String -Path $envFile -Pattern '^\s*HEADLESS\s*=\s*(.+)$' | Select-Object -Last 1
   if ($headless -and $headless.Matches[0].Groups[1].Value.Trim() -match '^(true|1)$') {
-    Write-Host "    WARNING: .env has HEADLESS=true — set HEADLESS=false for a visible browser." -ForegroundColor Yellow
+    Write-Host "    WARNING: .env has HEADLESS=true -- set HEADLESS=false for a visible browser." -ForegroundColor Yellow
   }
 }
 
@@ -81,7 +81,7 @@ Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger `
 Write-Host "    task registered." -ForegroundColor Green
 
 Write-Host ""
-Write-Host "==> REMAINING MANUAL STEP — enable autologon (so the box reaches an interactive" -ForegroundColor Yellow
+Write-Host "==> REMAINING MANUAL STEP -- enable autologon (so the box reaches an interactive" -ForegroundColor Yellow
 Write-Host "    desktop after reboot with no human at the keyboard). Use Sysinternals Autologon"
 Write-Host "    (stores the password encrypted in LSA, far safer than the registry):"
 Write-Host ""

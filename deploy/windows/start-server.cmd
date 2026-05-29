@@ -4,9 +4,9 @@ REM Launch wrapper for mca-filing-service.
 REM
 REM Used by the Task Scheduler "visible headed" path (setup-headed-autologon.ps1)
 REM and handy for a manual foreground run. The NSSM service does NOT use this
-REM wrapper — it invokes node.exe directly (see install-nssm-service.ps1).
+REM wrapper -- it invokes node.exe directly (see install-nssm-service.ps1).
 REM
-REM Working directory MUST be the repo root so that `import 'dotenv/config'`
+REM Working directory MUST be the repo root so that import 'dotenv/config'
 REM finds .env and Playwright resolves ./node_modules.
 REM ---------------------------------------------------------------------------
 setlocal

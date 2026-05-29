@@ -11,15 +11,15 @@
   ...with the working directory set to the repo root (so dotenv finds .env and
   Playwright resolves node_modules). A single node.exe child = clean stop/restart.
 
-  IMPORTANT — Session 0 isolation:
+  IMPORTANT -- Session 0 isolation:
     A Windows Service runs in Session 0, which has no interactive desktop on
     Windows 10/11 and Server 2016+. If HEADLESS=false, Chromium will still LAUNCH
     but will be INVISIBLE to anyone logged in over RDP/console. Use this NSSM path
-    for HEADLESS=true. For a *watchable* headed browser, use
+    for HEADLESS=true. For a watchable headed browser, use
     setup-headed-autologon.ps1 instead.
 
 .NOTES
-  Run from an ELEVATED PowerShell. Requires nssm.exe — download from
+  Run from an ELEVATED PowerShell. Requires nssm.exe -- download from
   https://nssm.cc/download (unzip win64\nssm.exe) and pass its path, or drop it on
   PATH. Or install via:  winget install NSSM.NSSM   /   choco install nssm
 
@@ -28,7 +28,7 @@
 .PARAMETER ServiceName  Windows service name. Default 'mca-filing-service'.
 .PARAMETER LogDir       Where stdout/stderr are written. Default <RepoRoot>\logs.
 .PARAMETER ServiceUser  Optional 'DOMAIN\user' or '.\user' to run as. Default = LocalSystem.
-.PARAMETER ServicePassword  Password for ServiceUser (SecureString-ish plain; required if ServiceUser set).
+.PARAMETER ServicePassword  Password for ServiceUser (required if ServiceUser set).
 #>
 [CmdletBinding()]
 param(
@@ -50,7 +50,7 @@ $nssm = $nssm.Source
 
 $node = (Get-Command node -ErrorAction Stop).Source
 $entry = Join-Path $RepoRoot 'src\server\index.ts'
-if (-not (Test-Path $entry)) { throw "Entry not found: $entry — is -RepoRoot correct?" }
+if (-not (Test-Path $entry)) { throw "Entry not found: $entry -- is -RepoRoot correct?" }
 
 New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
 $browsersPath = [Environment]::GetEnvironmentVariable('PLAYWRIGHT_BROWSERS_PATH', 'Machine')
@@ -65,7 +65,7 @@ Write-Host "    browsers= $browsersPath"
 # --- remove any prior definition (idempotent) --------------------------------
 $existing = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
 if ($existing) {
-  Write-Host "==> Existing service found — stopping + removing for clean reinstall." -ForegroundColor Yellow
+  Write-Host "==> Existing service found -- stopping + removing for clean reinstall." -ForegroundColor Yellow
   & $nssm stop $ServiceName confirm 2>$null | Out-Null
   & $nssm remove $ServiceName confirm | Out-Null
   Start-Sleep -Seconds 1
@@ -83,7 +83,7 @@ if ($existing) {
 # in the service environment so Chromium is found.
 & $nssm set $ServiceName AppEnvironmentExtra "PLAYWRIGHT_BROWSERS_PATH=$browsersPath" "NODE_ENV=production"
 
-# Logging — rotate at 10 MB
+# Logging -- rotate at 10 MB
 & $nssm set $ServiceName AppStdout (Join-Path $LogDir 'service.out.log')
 & $nssm set $ServiceName AppStderr (Join-Path $LogDir 'service.err.log')
 & $nssm set $ServiceName AppRotateFiles 1
@@ -95,7 +95,7 @@ if ($existing) {
 & $nssm set $ServiceName AppRestartDelay 5000
 & $nssm set $ServiceName AppThrottle 5000
 
-# Graceful stop — give in-flight Playwright browsers time to close (index.ts traps SIGTERM/SIGINT)
+# Graceful stop -- give in-flight Playwright browsers time to close (index.ts traps SIGTERM/SIGINT)
 & $nssm set $ServiceName AppStopMethodConsole 15000
 & $nssm set $ServiceName AppStopMethodWindow 5000
 

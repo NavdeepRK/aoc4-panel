@@ -75,9 +75,9 @@ try {
   $envExample = Join-Path $RepoRoot '.env.example'
   if (-not (Test-Path $envFile)) {
     Copy-Item $envExample $envFile
-    Write-Host "==> Created .env from .env.example — EDIT IT before starting the service." -ForegroundColor Yellow
+    Write-Host "==> Created .env from .env.example -- EDIT IT before starting the service." -ForegroundColor Yellow
   } else {
-    Write-Host "==> .env already exists — leaving it untouched." -ForegroundColor Green
+    Write-Host "==> .env already exists -- leaving it untouched." -ForegroundColor Green
   }
 
   # --- 6. Smoke test ---------------------------------------------------------
