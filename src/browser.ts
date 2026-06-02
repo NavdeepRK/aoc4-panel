@@ -17,6 +17,29 @@ const env = (k: string, d?: string) => process.env[k] ?? d;
 const truthy = (v: string | undefined) => v === 'true' || v === '1';
 
 /**
+ * Registry of every Chromium this process has launched and not yet closed.
+ *
+ * The server's SIGTERM/SIGINT handler calls closeAllBrowsers() so that a pm2 restart
+ * (or any graceful stop) closes in-flight job browsers instead of orphaning Chromium
+ * and leaking its /tmp profile dir. Each browser self-removes on 'disconnected', so the
+ * set stays accurate no matter how the browser was closed (teardown(), crash, etc.).
+ */
+const openBrowsers = new Set<Browser>();
+
+/** Close every still-open browser this process launched. Best-effort, never throws. */
+export async function closeAllBrowsers(): Promise<void> {
+  await Promise.all(
+    [...openBrowsers].map(async (b) => {
+      try {
+        await b.close();
+      } catch {
+        /* already gone */
+      }
+    }),
+  );
+}
+
+/**
  * Scripts the MCA portal loads that interfere with automation. Blocked at the route layer
  * so they never reach the page.
  *
@@ -43,6 +66,9 @@ export async function launch(opts: LaunchOptions = {}): Promise<{ browser: Brows
   const loadSession = opts.loadSession ?? true;
 
   const browser = await chromium.launch({ headless, slowMo });
+  // Track for graceful shutdown; self-remove whenever it closes (any path).
+  openBrowsers.add(browser);
+  browser.on('disconnected', () => openBrowsers.delete(browser));
 
   const contextOptions: Parameters<typeof browser.newContext>[0] = {
     viewport: { width: 1366, height: 900 },

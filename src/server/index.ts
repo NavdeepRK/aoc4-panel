@@ -27,6 +27,7 @@ import { createJob, getJob, publicView, setPhase, listJobs, hydrateJobsFromDisk,
 import { runAoc4Job, uploadSignedPdfAndSubmit, downloadDraftPdfViaTab } from './aoc4-worker.js';
 import { fetchCompanyInfoByCin, fetchPanByCin } from './company-lookup.js';
 import { startHeartbeat, stopHeartbeat, pingMca } from './session-heartbeat.js';
+import { closeAllBrowsers } from '../browser.js';
 
 const PORT = Number(process.env.MCA_FILING_PORT ?? 8090);
 const ARTIFACT_ROOT = process.env.MCA_FILING_ARTIFACT_DIR ?? './.artifacts/runs';
@@ -464,9 +465,19 @@ server.listen(PORT, () => {
 
 // Graceful shutdown so in-flight Playwright browsers get a chance to close
 const shutdown = async (sig: string): Promise<void> => {
-  process.stderr.write(`[mca-filing-service] received ${sig}, draining…\n`);
+  process.stderr.write(`[aoc4-panel] received ${sig}, draining…\n`);
   stopHeartbeat();
   server.close();
+  // Close any in-flight job browsers so a pm2 restart / SIGTERM doesn't orphan Chromium
+  // and leak its profile dir. Best-effort and bounded so shutdown can't hang on it.
+  try {
+    await Promise.race([
+      closeAllBrowsers(),
+      new Promise<void>((r) => setTimeout(r, 8_000)),
+    ]);
+  } catch {
+    /* best effort */
+  }
   process.exit(0);
 };
 process.on('SIGTERM', () => void shutdown('SIGTERM'));
