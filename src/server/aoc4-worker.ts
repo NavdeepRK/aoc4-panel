@@ -123,25 +123,58 @@ async function _postStorageStateBack(
  */
 async function _dismissAlreadyLoggedInPopup(page: import('playwright').Page): Promise<boolean> {
   try {
-    // The dialog text varies slightly. Match on the recognisable phrase.
-    const dialog = page.locator('text=/already\\s*logged\\s*in/i').first();
-    if (await dialog.count() === 0) return false;
-    // Find a Yes/Continue/OK button reasonably near the message
-    const yesBtn = page
-      .getByRole('button', { name: /^(yes|continue|ok|proceed|confirm)$/i })
+    // The dialog text varies. Match on any of MCA's known phrasings.
+    // Confirmed live phrasings:
+    //   "You already have an active session. Logging in here again will end that session. Do you want to continue?"
+    //   "This account is already logged in somewhere else. Do you want to continue here?"
+    const dialogText = page
+      .locator('text=/already\\s*logged\\s*in|active\\s*session|end\\s*that\\s*session|logout\\s*old\\s*session|another\\s*session|continue\\s*here|logging\\s*in\\s*here\\s*again/i')
       .first();
-    if (await yesBtn.count() > 0) {
+    if (await dialogText.count() === 0) return false;
+
+    // 1. Try button by accessible name (Yes / Continue / Proceed / OK / Confirm)
+    const yesBtn = page
+      .getByRole('button', { name: /^(yes|continue|ok|proceed|confirm|continue\s*here)$/i })
+      .first();
+    if (await yesBtn.count() > 0 && await yesBtn.isVisible().catch(() => false)) {
       await yesBtn.click({ timeout: 3000, force: true });
       return true;
     }
-    // Fallback: any visible <button>/<a> with that text inside a modal-ish container
+    // 2. Any visible clickable element with that text
     const fallback = page.locator('button, a, input[type="button"], input[type="submit"]')
       .filter({ hasText: /^\s*(yes|continue|ok|proceed|confirm)\s*$/i })
       .first();
-    if (await fallback.count() > 0) {
+    if (await fallback.count() > 0 && await fallback.isVisible().catch(() => false)) {
       await fallback.click({ timeout: 3000, force: true });
       return true;
     }
+    // 3. AEM modal buttons sometimes render as <div role="button"> — try generic role match
+    const roleBtn = page.locator('[role="button"]')
+      .filter({ hasText: /^\s*(yes|continue|ok|proceed|confirm)\s*$/i })
+      .first();
+    if (await roleBtn.count() > 0 && await roleBtn.isVisible().catch(() => false)) {
+      await roleBtn.click({ timeout: 3000, force: true });
+      return true;
+    }
+    // 4. Last resort: in-page JS click on any element whose textContent equals one of
+    //    the affirmative words inside an element related to the dialog text.
+    const clicked = await page.evaluate(() => {
+      const txt = /^\s*(yes|continue|ok|proceed|confirm)\s*$/i;
+      // Find any modal/dialog containing the "already-logged-in" phrasings
+      const wrappers = Array.from(document.querySelectorAll('div, section'))
+        .filter(el => /already\s*logged\s*in|active\s*session|end\s*that\s*session|another\s*session|continue\s*here|logging\s*in\s*here\s*again/i.test(el.textContent ?? ''));
+      for (const w of wrappers) {
+        const btns = Array.from(w.querySelectorAll<HTMLElement>('button, a, [role="button"], input[type="button"], input[type="submit"]'));
+        for (const b of btns) {
+          if (txt.test((b.textContent ?? '').trim()) || txt.test((b as HTMLInputElement).value ?? '')) {
+            (b as HTMLElement).click();
+            return true;
+          }
+        }
+      }
+      return false;
+    });
+    if (clicked) return true;
   } catch { /* swallow — best-effort */ }
   return false;
 }
@@ -267,11 +300,15 @@ export async function runAoc4Job(job: Aoc4Job, opts: { artifactDir: string; skip
 
     // Poll for the next state — could be OTP step, invalid creds, captcha,
     // OR the "already logged in elsewhere" interstitial. Auto-dismiss the
-    // latter on every iteration so the worker doesn't stall.
+    // latter on EVERY iteration regardless of observed step — MCA sometimes
+    // shows it after step transitions to otp/logged-in too, and stalling there
+    // means the SPOC sees a confused worker.
     let postLoginObs = await observe(page);
-    for (let i = 0; i < 30 && (postLoginObs.step === 'login-form' || postLoginObs.step === 'unknown'); i++) {
+    for (let i = 0; i < 30; i++) {
       const dismissed = await _dismissAlreadyLoggedInPopup(page);
-      if (dismissed) log('dismissed "already logged in elsewhere" popup');
+      if (dismissed) log(`dismissed "already logged in elsewhere" popup (iter ${i})`);
+      // Stop polling once we've reached a definitive step
+      if (postLoginObs.step === 'otp' || postLoginObs.step === 'logged-in' || postLoginObs.step === 'invalid-credentials' || postLoginObs.step === 'captcha') break;
       await page.waitForTimeout(500);
       postLoginObs = await observe(page);
     }
@@ -1687,6 +1724,436 @@ async function _clickWidgetByLabel(
   }
 }
 
+/**
+ * Strategy 1 for radios: enumerate every radio group visible in the form,
+ * identify each group by the human-readable question text near it, find the
+ * one matching `questionLabel`, then click the radio whose nearby text matches
+ * `optionLabel` (Yes/No/Not applicable/etc).
+ *
+ * This sidesteps MCA's two main quirks:
+ *   - AEM internal field IDs (the previous ancestor-id substring match was
+ *     fragile and sometimes hit multiple unrelated radios).
+ *   - `gb.setProperty(som, 'value', 'Yes')` succeeds at the model level but
+ *     MCA's option-matcher doesn't have "Yes" in its enum list, so the visible
+ *     widget falls back to the default (the last option, "Not applicable"),
+ *     and MCA's save validator rejects with "Please select a valid option".
+ *
+ * We do this entirely in page.evaluate so the click is a real DOM event
+ * (AEM's onclick handler runs, the internal enum value gets written, the
+ * widget visually updates).
+ */
+async function _clickRadioByVisibleText(
+  page: import('playwright').Page,
+  questionLabel: string,
+  optionLabel: string,
+  fieldName?: string,
+): Promise<{ ok: boolean; reason: string }> {
+  // Normalize the question text. We DO want to keep the parens/numbering when
+  // matching to disambiguate "7(a) Whether annual general meeting" from
+  // "8(a) Whether ... subsidiary", but we strip the leading `*` mandatory mark.
+  const wantQuestion = questionLabel.replace(/^\s*\*\s*/, '').trim();
+  const wantOption = optionLabel.trim();
+  try {
+    const result = await page.evaluate(({ wantQuestion, wantOption, fieldName }) => {
+      // ═══════════════════════════════════════════════════════════════════════
+      // PRIMARY STRATEGY: read AEM's GuideBridge option list to find the REAL
+      // internal value that corresponds to the desired visible label, then
+      // click the DOM radio with that exact `.value` attribute AND write the
+      // same value to the model via setProperty. This is the only approach
+      // that's guaranteed correct because we're using MCA's own configured
+      // {value, label} mapping — not guessing.
+      // ═══════════════════════════════════════════════════════════════════════
+      type GbNode = {
+        name?: string;
+        somExpression?: string;
+        items?: GbNode[];
+        options?: Array<{ value: unknown; label?: string; text?: string }>;
+        jsonModel?: { options?: Array<{ value: unknown; label?: string; text?: string }> };
+        value?: unknown;
+      };
+      const gbAny = (window as unknown as {
+        guideBridge?: {
+          resolveNode: (s: string) => unknown;
+          setProperty: (s: string[], p: string, v: unknown[]) => void;
+        };
+      }).guideBridge;
+      const normLoose = (s: unknown): string =>
+        String(s ?? '').replace(/\s+/g, ' ').trim().toLowerCase();
+      if (gbAny && fieldName) {
+        const findNode = (root: GbNode | null, target: string): GbNode | null => {
+          let hit: GbNode | null = null;
+          const walk = (n: GbNode | undefined): void => {
+            if (!n || hit) return;
+            if (n.name === target && n.somExpression) { hit = n; return; }
+            if (Array.isArray(n.items)) for (const k of n.items) walk(k);
+          };
+          walk(root ?? undefined);
+          return hit;
+        };
+        try {
+          const root = gbAny.resolveNode('rootPanel') as GbNode | null;
+          const node = findNode(root, fieldName);
+          if (node && node.somExpression) {
+            const opts = node.options ?? node.jsonModel?.options ?? [];
+            if (Array.isArray(opts) && opts.length > 0) {
+              const wantOpt = normLoose(wantOption);
+              // Find the option whose label/text equals the desired visible label.
+              // AEM stores them as either `label` or `text` depending on version.
+              const matched = opts.find(o => {
+                const lbl = normLoose(o.label ?? o.text);
+                return lbl === wantOpt;
+              });
+              if (matched) {
+                const realValue = String(matched.value);
+                const canonicalLabel = String(matched.label ?? matched.text ?? wantOption);
+                // ── Locate the radio group near this field name ──
+                // MCA renders ALL radios in a group with HTML `value="on"`
+                // (the option discrimination lives in AEM's model, not the
+                // HTML form encoding). So matching by `.value` attribute is
+                // useless. Instead we collect all radios whose ancestor id
+                // contains the field name, then pick the one whose nearby
+                // text equals the AEM-canonical label.
+                const allRadios = Array.from(document.querySelectorAll<HTMLInputElement>('input[type="radio"]'));
+                const fLower = fieldName.toLowerCase();
+                const groupRadios: HTMLInputElement[] = [];
+                for (const r of allRadios) {
+                  let el: HTMLElement | null = r;
+                  while (el) {
+                    if (el.id && el.id.toLowerCase().includes(fLower)) { groupRadios.push(r); break; }
+                    el = el.parentElement;
+                  }
+                }
+                // Per-radio PRIMARY LABEL collector (uniquely identifies one
+                // radio in the group — excludes parent text to avoid the
+                // "Yes No" parent-contamination case).
+                const collectPrimary = (r: HTMLInputElement): string => {
+                  if (r.id) {
+                    const lbl = document.querySelector<HTMLLabelElement>(`label[for="${CSS.escape(r.id)}"]`);
+                    const t = normLoose(lbl?.textContent);
+                    if (t) return t;
+                  }
+                  const wrap = r.closest('label');
+                  if (wrap) {
+                    const direct = Array.from(wrap.childNodes)
+                      .filter(nd => nd.nodeType === Node.TEXT_NODE)
+                      .map(nd => nd.textContent ?? '')
+                      .join(' ');
+                    const t = normLoose(direct) || normLoose(wrap.textContent);
+                    if (t) return t;
+                  }
+                  let nx: Node | null = r.nextSibling;
+                  while (nx && nx.nodeType === Node.TEXT_NODE && !(nx.textContent ?? '').trim()) nx = nx.nextSibling;
+                  if (nx && nx.nodeType === Node.TEXT_NODE) {
+                    const t = normLoose(nx.textContent);
+                    if (t) return t;
+                  }
+                  if (r.nextElementSibling) {
+                    const raw = r.nextElementSibling.textContent ?? '';
+                    if (raw.length <= 30) {
+                      const t = normLoose(raw);
+                      if (t) return t;
+                    }
+                  }
+                  const aria = normLoose(r.getAttribute('aria-label'));
+                  if (aria) return aria;
+                  return '';
+                };
+                const primaries: string[] = groupRadios.map(r => collectPrimary(r));
+                const wantOptNorm = normLoose(canonicalLabel);
+                // Prefer exact match; fall back to word-boundary
+                let chosen = primaries.findIndex(p => p === wantOptNorm);
+                if (chosen === -1) {
+                  const re = new RegExp(`(^|[^a-z])${wantOptNorm.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}($|[^a-z])`);
+                  chosen = primaries.findIndex(p => re.test(p));
+                }
+                // ── Last resort: use the option's INDEX in AEM's options array ──
+                // If primary-label collection came up empty for all radios
+                // (e.g., labels are styled in a way none of our six sources
+                // catch), the radio at AEM's option index is still likely to
+                // be in the same visual position as the option list itself.
+                if (chosen === -1) {
+                  const optIdx = opts.findIndex(o => normLoose(o.label ?? o.text) === wantOpt);
+                  if (optIdx !== -1 && optIdx < groupRadios.length) {
+                    chosen = optIdx;
+                  }
+                }
+                let domClicked = false;
+                if (chosen !== -1 && chosen < groupRadios.length) {
+                  const target = groupRadios[chosen];
+                  for (const sib of groupRadios) {
+                    if (sib !== target && sib.name === target.name) sib.checked = false;
+                  }
+                  target.scrollIntoView({ block: 'center' });
+                  target.checked = true;
+                  try { target.click(); } catch { /* */ }
+                  target.dispatchEvent(new Event('input', { bubbles: true }));
+                  target.dispatchEvent(new Event('change', { bubbles: true }));
+                  target.dispatchEvent(new Event('blur', { bubbles: true }));
+                  domClicked = true;
+                }
+                // Belt-and-suspenders: write the AEM-canonical value to model.
+                try { gbAny.setProperty([node.somExpression], 'value', [realValue]); } catch { /* */ }
+                const after = node.value;
+                return {
+                  ok: domClicked,
+                  reason: `AEM-option-list: "${wantOption}" → label="${canonicalLabel}" value="${realValue}"; DOM-click=${domClicked ? `idx${chosen} of ${groupRadios.length}` : `FAIL (primaries=${JSON.stringify(primaries)})`}; model="${String(after)}"`,
+                };
+              }
+              // Options exist but no label match — log full list for diagnosis
+              const dump = opts.map(o => ({ value: o.value, label: o.label ?? o.text }));
+              // continue to fallback strategy below
+              void dump;
+            }
+          }
+        } catch { /* fall through to DOM strategy */ }
+      }
+      // ═══════════════════════════════════════════════════════════════════════
+      // FALLBACK STRATEGY: enumerate visible radio groups, identify each by its
+      // on-screen question text, then click the radio whose primary label
+      // matches the desired option label.
+      // ═══════════════════════════════════════════════════════════════════════
+      // ── Step 1: collect every radio group on the page ────────────────────
+      // A "group" = all <input type="radio"> sharing the same `name` attr.
+      const radios = Array.from(document.querySelectorAll<HTMLInputElement>('input[type="radio"]'));
+      const groups = new Map<string, HTMLInputElement[]>();
+      for (const r of radios) {
+        const key = r.name || r.id || `__unnamed_${r.offsetTop}_${r.offsetLeft}`;
+        if (!groups.has(key)) groups.set(key, []);
+        groups.get(key)!.push(r);
+      }
+      // ── Step 2: for each group, derive its "question text" ───────────────
+      // Strategy: walk upward from the first radio of the group looking at
+      // siblings/preceding text until we hit something that looks like a
+      // question (>= 12 chars, mostly letters, contains a `?` or known
+      // numbering pattern).
+      const norm = (s: string | null | undefined): string =>
+        String(s ?? '').replace(/\s+/g, ' ').trim().toLowerCase();
+      const sample = (el: Element | null | undefined): string =>
+        norm(el?.textContent).slice(0, 240);
+      const looksLikeQuestion = (s: string): boolean => {
+        if (!s) return false;
+        if (s.length < 8) return false;
+        // numbering like "1(a)", "7 (a)", "(iii)", or a `?`
+        return /\b\d+\s*\(?[a-z]\)?|\b\([ivx]+\)|\?$|whether|date|number|amount|name/i.test(s);
+      };
+      type GroupInfo = { question: string; radios: HTMLInputElement[]; container: Element | null };
+      const groupInfos: GroupInfo[] = [];
+      for (const [key, radioList] of groups) {
+        if (radioList.length < 2) continue; // not a radio group
+        const first = radioList[0];
+        // Find the smallest ancestor that contains ALL radios of this group
+        let container: Element | null = first.parentElement;
+        while (container) {
+          if (radioList.every(r => container!.contains(r))) break;
+          container = container.parentElement;
+        }
+        // Walk up from container looking for a question-like text.
+        let question = '';
+        let cur: Element | null = container;
+        for (let depth = 0; cur && depth < 8; depth++, cur = cur.parentElement) {
+          // 1. Try previous element sibling
+          let sib: Element | null = cur.previousElementSibling;
+          while (sib) {
+            const t = sample(sib);
+            if (looksLikeQuestion(t)) { question = t; break; }
+            sib = sib.previousElementSibling;
+          }
+          if (question) break;
+          // 2. Try the cur element's own first text-bearing child that ISN'T
+          //    a child of the radio container (so we don't pick up Yes/No text).
+          for (const child of Array.from(cur.children)) {
+            if (radioList.some(r => child.contains(r))) continue;
+            const t = sample(child);
+            if (looksLikeQuestion(t)) { question = t; break; }
+          }
+          if (question) break;
+        }
+        groupInfos.push({ question, radios: radioList, container });
+        void key;
+      }
+      // ── Step 3: match `wantQuestion` against each group's derived question ─
+      const wantQ = norm(wantQuestion);
+      // Try exact-substring match first (either direction), then a fuzzier
+      // word-overlap match for cases where MCA's text drops the "7 (a)" prefix
+      // or rephrases slightly.
+      const tokens = (s: string): string[] => s.split(/[^a-z0-9]+/).filter(t => t.length >= 4);
+      const wantTokens = new Set(tokens(wantQ));
+      let best: { score: number; info: GroupInfo } | null = null;
+      for (const info of groupInfos) {
+        if (!info.question) continue;
+        if (info.question.includes(wantQ) || wantQ.includes(info.question)) {
+          best = { score: 999, info };
+          break;
+        }
+        const got = tokens(info.question);
+        const overlap = got.filter(t => wantTokens.has(t)).length;
+        if (!best || overlap > best.score) best = { score: overlap, info };
+      }
+      if (!best || best.score < 2) {
+        return {
+          ok: false,
+          reason: `no radio group matched question "${wantQuestion.slice(0,60)}". Groups found: ${groupInfos.length}. Top samples: ${JSON.stringify(groupInfos.slice(0,5).map(g => g.question.slice(0,60)))}`,
+        };
+      }
+      const target = best.info;
+      // ── Step 4: pick the radio in this group whose nearby text matches the
+      //           desired option label.
+      // Collect text that uniquely identifies THIS radio (not shared with its
+      // siblings). Parent's textContent is excluded because in a row like
+      // `<div>Yes <input> No <input></div>` it contains both option labels and
+      // would let either radio match either option, silently inverting the
+      // user's selection. We rely only on per-radio sources.
+      const collectPrimaryLabel = (r: HTMLInputElement): string => {
+        // 1. <label for=id> — most explicit
+        if (r.id) {
+          const lbl = document.querySelector<HTMLLabelElement>(`label[for="${CSS.escape(r.id)}"]`);
+          const t = norm(lbl?.textContent);
+          if (t) return t;
+        }
+        // 2. Wrapping <label> — but only its OWN text, not nested element text
+        //    (closest('label')?.textContent would include other inputs too).
+        const wrap = r.closest('label');
+        if (wrap) {
+          // Take only the wrapping label's direct text nodes (skip nested inputs/spans)
+          const direct = Array.from(wrap.childNodes)
+            .filter(n => n.nodeType === Node.TEXT_NODE)
+            .map(n => n.textContent ?? '')
+            .join(' ');
+          const t = norm(direct) || norm(wrap.textContent);
+          if (t) return t;
+        }
+        // 3. Immediate next text sibling (skip blank whitespace)
+        let n: Node | null = r.nextSibling;
+        while (n && n.nodeType === Node.TEXT_NODE && !(n.textContent ?? '').trim()) n = n.nextSibling;
+        if (n && n.nodeType === Node.TEXT_NODE) {
+          const t = norm(n.textContent);
+          if (t) return t;
+        }
+        // 4. Immediate next element sibling's text — but only if short (likely a
+        //    <span>Yes</span>, not a wrapper with more content)
+        if (r.nextElementSibling) {
+          const raw = r.nextElementSibling.textContent ?? '';
+          if (raw.length <= 30) {
+            const t = norm(raw);
+            if (t) return t;
+          }
+        }
+        // 5. aria-label
+        const aria = norm(r.getAttribute('aria-label'));
+        if (aria) return aria;
+        // 6. Last resort: value attribute (often "on" for MCA — useless but
+        //    not actively wrong)
+        return norm(r.value);
+      };
+      const wantOpt = norm(wantOption);
+      const optionMatches = (primary: string): boolean => {
+        if (!primary) return false;
+        if (primary === wantOpt) return true;
+        // Word-boundary match so "no" doesn't match "not applicable" and
+        // "yes" doesn't match "yes/no".
+        const re = new RegExp(`(^|[^a-z])${wantOpt.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}($|[^a-z])`);
+        return re.test(primary);
+      };
+      // First pass: collect each radio's primary label. Then find the radio
+      // whose primary label EXACTLY equals the desired option (strongest
+      // signal); if no exact match, fall back to word-boundary match.
+      const sampledOptions: Array<{ value: string; primary: string }> = [];
+      const primaries: string[] = target.radios.map(r => collectPrimaryLabel(r));
+      target.radios.forEach((r, i) => sampledOptions.push({ value: r.value, primary: primaries[i].slice(0, 40) }));
+
+      // Strictest match: primary label === wantOpt
+      let chosen = target.radios.findIndex((_, i) => primaries[i] === wantOpt);
+      let matchReason = `primary label === "${wantOpt}"`;
+      // Fallback: word-boundary match
+      if (chosen === -1) {
+        chosen = target.radios.findIndex((_, i) => optionMatches(primaries[i]));
+        matchReason = `word-boundary match on "${wantOpt}"`;
+      }
+      // Safety check: if multiple radios match the word-boundary regex (shouldn't
+      // happen with primary-only labels, but guard anyway), bail rather than guess.
+      if (chosen !== -1) {
+        const allMatches = primaries.filter(p => optionMatches(p)).length;
+        if (allMatches > 1 && primaries[chosen] !== wantOpt) {
+          return {
+            ok: false,
+            reason: `${allMatches} radios matched "${wantOption}" by word-boundary — ambiguous, refusing to guess. Primaries: ${JSON.stringify(primaries)}`,
+          };
+        }
+      }
+      if (chosen === -1) {
+        return {
+          ok: false,
+          reason: `radio group matched question but no radio's primary label matched option "${wantOption}". Sampled: ${JSON.stringify(sampledOptions)}`,
+        };
+      }
+      const r = target.radios[chosen];
+      // Uncheck siblings first
+      for (const sib of target.radios) {
+        if (sib !== r) sib.checked = false;
+      }
+      r.scrollIntoView({ block: 'center' });
+      r.checked = true;
+      try { r.click(); } catch { /* */ }
+      r.dispatchEvent(new Event('input',  { bubbles: true }));
+      r.dispatchEvent(new Event('change', { bubbles: true }));
+      r.dispatchEvent(new Event('blur',   { bubbles: true }));
+
+      // ── CRITICAL: also write the clicked radio's REAL value into AEM's model.
+      // The DOM click alone is cosmetic — AEM's GuideBridge model is the source
+      // of truth. For fields with conditional dependents (e.g. 7(a) reveals
+      // 7(b)/(c)/(d) when Yes), AEM RE-RENDERS the section after the visibility
+      // rule fires, reading the model to repaint each widget. If the model still
+      // holds the default (because we only touched the DOM), the re-render
+      // REVERTS the radio to its default (the last option, "Not applicable").
+      // The DOM radio's `value` attribute IS the real AEM option code (confirmed
+      // live: 0=Yes, 1=No, 2=Not applicable), so setProperty(value) survives the
+      // re-render. We resolve the node by the field name passed in, else by
+      // matching the radio's ancestor id / name.
+      let modelWrite = 'no-som';
+      try {
+        const gb2 = (window as unknown as {
+          guideBridge?: { resolveNode: (s: string) => unknown; setProperty: (s: string[], p: string, v: unknown[]) => void };
+        }).guideBridge;
+        if (gb2) {
+          type GN = { name?: string; somExpression?: string; items?: GN[]; value?: unknown };
+          const rootN = gb2.resolveNode('rootPanel') as GN | null;
+          // Coerce with String() — AEM node `.name` is usually a string but some
+          // nodes expose it as a non-string (number/function); a bare `?? ''`
+          // would let that through and `.toLowerCase()` would throw, which is
+          // exactly what silently killed this setProperty before.
+          const lc = (s: unknown) => String(s ?? '').toLowerCase();
+          const want = lc(fieldName);
+          let node: GN | null = null;
+          const walk2 = (n: GN | undefined): void => {
+            if (!n || node) return;
+            if (n.somExpression && n.name) {
+              // Match by exact field name when provided; otherwise by the radio's
+              // name/id containing the node name (best-effort).
+              if (want && lc(n.name) === want) { node = n; return; }
+            }
+            if (Array.isArray(n.items)) for (const k of n.items) walk2(k);
+          };
+          walk2(rootN ?? undefined);
+          if (node && (node as GN).somExpression) {
+            const som = (node as GN).somExpression as string;
+            gb2.setProperty([som], 'value', [r.value]);
+            const after = (gb2.resolveNode(som) as GN | null)?.value;
+            modelWrite = `setProperty(value="${r.value}") → model="${String(after)}"`;
+          }
+        }
+      } catch (e) { modelWrite = `setProperty-threw: ${(e as Error).message.slice(0, 60)}`; }
+
+      return {
+        ok: true,
+        reason: `clicked radio[${chosen}] value="${r.value}" primary="${primaries[chosen]}" (${matchReason}); ${modelWrite}`,
+      };
+    }, { wantQuestion, wantOption, fieldName: fieldName ?? '' });
+    return result;
+  } catch (e) {
+    return { ok: false, reason: `_clickRadioByVisibleText threw: ${(e as Error).message.slice(0, 160)}` };
+  }
+}
+
 async function _applyDirectOverrides(
   page: import('playwright').Page,
   overrides: Record<string, string | number>,
@@ -1704,12 +2171,150 @@ async function _applyDirectOverrides(
       const meta = fieldMeta[name];
       if (!meta) continue;
       if (meta.widget !== 'radio' && meta.widget !== 'dropdown') continue;
-      const r = await _clickWidgetByLabel(page, meta.questionLabel, String(value), meta.widget);
+
+      // ── Strategy 1: enumerate visible form radio groups, identify each by its
+      // on-screen question text, then click the radio whose nearby text matches
+      // the desired option label. This is the most direct — it mirrors what a
+      // human does: "I see Yes / No / Not applicable next to '7(a) Whether AGM
+      // held'; click Yes". No AEM IDs, no <label> elements required.
+      let r: { ok: boolean; reason: string };
+      if (meta.widget === 'radio') {
+        // Pass `name` (the AEM field name) so Strategy 1 can read AEM's option
+        // list and find the real internal value for the desired visible label.
+        r = await _clickRadioByVisibleText(page, meta.questionLabel, String(value), name);
+      } else {
+        r = { ok: false, reason: 'skip-strategy1-for-dropdown' };
+      }
+
+      // Strategy 2: legacy label-near-question locator (only if Strategy 1 missed)
+      if (!r.ok) {
+        const r2 = await _clickWidgetByLabel(page, meta.questionLabel, String(value), meta.widget);
+        if (r2.ok) r = r2;
+        else r = { ok: false, reason: `[S1] ${r.reason} | [S2] ${r2.reason}` };
+      }
+
       passAResults.push({ name, value: String(value), ok: r.ok, widget: meta.widget, reason: r.reason, finalValue: r.ok ? String(value) : undefined });
-      handledByLocator.add(name);
-      // Tiny pause between clicks so AEM has time to render conditional fields
-      // (e.g. 7(a) Yes → shows 7(b) date picker) before we try the next override.
-      await page.waitForTimeout(200);
+      // Stream key radio writes to the worker terminal so we can see live what's happening.
+      // (page.evaluate diagnostics are otherwise only visible in the artifact JSON.)
+      // eslint-disable-next-line no-console
+      console.log(`[radio] ${name}="${String(value)}" → ok=${r.ok} | ${r.reason}`);
+      // Only mark as handled when ONE of the visible-click strategies succeeded.
+      // setProperty (Pass B) writes the literal label string to the AEM model
+      // which MCA's option-matcher rejects when the option's internal enum value
+      // differs from its display label — the visible widget then renders the
+      // default (e.g. "Not applicable") even though the model says "Yes". So
+      // visible-click is mandatory; only fall through to setProperty for
+      // genuinely-missing DOM (e.g. radio not yet rendered).
+      if (r.ok) handledByLocator.add(name);
+      // Wait long enough for AEM to re-render conditional dependents (e.g.
+      // 7(a) Yes reveals 7(b)/(c) date pickers; AEM's reactive render isn't
+      // instant — empirically 600-1000ms is the sweet spot).
+      await page.waitForTimeout(700);
+    }
+  }
+
+  // ── Pass A.5: VERIFY + RETRY radios ─────────────────────────────────────
+  // After all Pass A clicks, AEM may have re-rendered and clobbered some
+  // earlier writes (especially radios whose dependents triggered fresh render
+  // cycles). We assert on the DIRECTLY OBSERVABLE state — which radio is
+  // actually `.checked` — and re-click until it matches, up to 4 attempts with
+  // a settle wait so a slow re-render has finished before we judge. This is the
+  // safety net that does NOT rely on any theory about how AEM binds model→view:
+  // if the wrong radio is checked, we click again; if after 4 tries it's STILL
+  // wrong, we log the real observed label so the failure is loud and precise.
+  if (fieldMeta) {
+    // Let any pending re-render from the last click settle before first check.
+    await page.waitForTimeout(800);
+    for (let attempt = 0; attempt < 4; attempt++) {
+      let needRetry = false;
+      for (const [name, value] of Object.entries(overrides)) {
+        const meta = fieldMeta[name];
+        if (!meta || meta.widget !== 'radio') continue;
+        if (!handledByLocator.has(name)) continue; // never clicked OK in the first place
+        const wantOpt = String(value).trim().toLowerCase();
+        // Verify by the DIRECTLY OBSERVABLE state: which radio in the group is
+        // currently `.checked`, and what is its visible label? This doesn't rely
+        // on the node exposing an `options` array (7(a)'s node doesn't), so it
+        // gives a true read of what MCA will render + save.
+        const verify = await page.evaluate(({ fName }) => {
+          const lc = (s: unknown) => String(s ?? '').replace(/\s+/g, ' ').trim().toLowerCase();
+          const fLower = String(fName ?? '').toLowerCase();
+          const all = Array.from(document.querySelectorAll<HTMLInputElement>('input[type="radio"]'));
+          const group: HTMLInputElement[] = [];
+          for (const r of all) {
+            let el: HTMLElement | null = r;
+            while (el) {
+              if (el.id && el.id.toLowerCase().includes(fLower)) { group.push(r); break; }
+              el = el.parentElement;
+            }
+          }
+          if (group.length === 0) return { found: false, checkedLabel: '', anyChecked: false };
+          const primary = (r: HTMLInputElement): string => {
+            if (r.id) { const l = document.querySelector<HTMLLabelElement>(`label[for="${CSS.escape(r.id)}"]`); const t = lc(l?.textContent); if (t) return t; }
+            const w = r.closest('label'); if (w) { const d = Array.from(w.childNodes).filter(n => n.nodeType === Node.TEXT_NODE).map(n => n.textContent ?? '').join(' '); const t = lc(d) || lc(w.textContent); if (t) return t; }
+            let nx: Node | null = r.nextSibling; while (nx && nx.nodeType === Node.TEXT_NODE && !(nx.textContent ?? '').trim()) nx = nx.nextSibling;
+            if (nx && nx.nodeType === Node.TEXT_NODE) { const t = lc(nx.textContent); if (t) return t; }
+            if (r.nextElementSibling) { const raw = r.nextElementSibling.textContent ?? ''; if (raw.length <= 30) { const t = lc(raw); if (t) return t; } }
+            return lc(r.getAttribute('aria-label'));
+          };
+          const checked = group.find(r => r.checked);
+          return { found: true, checkedLabel: checked ? primary(checked) : '', anyChecked: !!checked };
+        }, { fName: name });
+        // Mismatch only when the group was found AND (nothing checked OR the
+        // checked radio's label differs from what we wanted). If we couldn't
+        // find the group at all, leave it — re-clicking blindly risks disturbing
+        // already-correct dependents.
+        const mismatch = verify.found && verify.checkedLabel !== wantOpt;
+        if (mismatch) {
+          // eslint-disable-next-line no-console
+          console.log(`[radio-verify] ${name} checkedLabel="${verify.checkedLabel}" wanted="${wantOpt}" anyChecked=${verify.anyChecked} → retry (attempt ${attempt + 1})`);
+          const r = await _clickRadioByVisibleText(page, meta.questionLabel, String(value), name);
+          // eslint-disable-next-line no-console
+          console.log(`[radio-retry] ${name} → ok=${r.ok} | ${r.reason}`);
+          await page.waitForTimeout(700);
+          needRetry = true;
+        }
+      }
+      if (!needRetry) break;
+    }
+    // Final audit: log any radio whose observed checked state STILL doesn't match
+    // what we wanted, so the failure is explicit (not hidden behind an optimistic
+    // ok:true from an earlier click). This is recorded into the results so it
+    // lands in the panel1-overrides.json artifact.
+    for (const [name, value] of Object.entries(overrides)) {
+      const meta = fieldMeta[name];
+      if (!meta || meta.widget !== 'radio') continue;
+      if (!handledByLocator.has(name)) continue;
+      const wantOpt = String(value).trim().toLowerCase();
+      const finalState = await page.evaluate(({ fName }) => {
+        const lc = (s: unknown) => String(s ?? '').replace(/\s+/g, ' ').trim().toLowerCase();
+        const fLower = String(fName ?? '').toLowerCase();
+        const all = Array.from(document.querySelectorAll<HTMLInputElement>('input[type="radio"]'));
+        const group: HTMLInputElement[] = [];
+        for (const r of all) {
+          let el: HTMLElement | null = r;
+          while (el) { if (el.id && el.id.toLowerCase().includes(fLower)) { group.push(r); break; } el = el.parentElement; }
+        }
+        const prim = (r: HTMLInputElement): string => {
+          if (r.id) { const l = document.querySelector<HTMLLabelElement>(`label[for="${CSS.escape(r.id)}"]`); const t = lc(l?.textContent); if (t) return t; }
+          const w = r.closest('label'); if (w) { const d = Array.from(w.childNodes).filter(n => n.nodeType === Node.TEXT_NODE).map(n => n.textContent ?? '').join(' '); const t = lc(d) || lc(w.textContent); if (t) return t; }
+          let nx: Node | null = r.nextSibling; while (nx && nx.nodeType === Node.TEXT_NODE && !(nx.textContent ?? '').trim()) nx = nx.nextSibling;
+          if (nx && nx.nodeType === Node.TEXT_NODE) { const t = lc(nx.textContent); if (t) return t; }
+          if (r.nextElementSibling) { const raw = r.nextElementSibling.textContent ?? ''; if (raw.length <= 30) { const t = lc(raw); if (t) return t; } }
+          return lc(r.getAttribute('aria-label'));
+        };
+        const checked = group.find(r => r.checked);
+        return { checkedLabel: checked ? prim(checked) : '(none checked)', groupSize: group.length };
+      }, { fName: name });
+      const ok = finalState.checkedLabel === wantOpt;
+      // eslint-disable-next-line no-console
+      console.log(`[radio-final] ${name} wanted="${wantOpt}" observed="${finalState.checkedLabel}" group=${finalState.groupSize} → ${ok ? 'OK ✓' : 'STILL WRONG ✗'}`);
+      // Reflect the final observed truth back into the result row.
+      const row = passAResults.find(x => x.name === name);
+      if (row) {
+        row.ok = ok;
+        row.reason += ` | FINAL observed checked="${finalState.checkedLabel}" ${ok ? '✓' : '✗ STILL WRONG'}`;
+      }
     }
   }
 
@@ -1782,15 +2387,11 @@ async function _applyDirectOverrides(
      * MCA radio labels use specific casing — note "Not applicable" (lowercase 'a'),
      * not "Not Applicable". We try both.
      */
-    const labelToEnumGuesses = (label: string): string[] => {
-      const l = label.trim().toLowerCase();
-      if (l === 'yes')             return ['Yes', '1', '0'];
-      if (l === 'no')              return ['No', '0', '1'];
-      if (l === 'not applicable')  return ['Not applicable', 'Not Applicable', '2', '3'];
-      if (l === 'individual')      return ['Individual', '1', '0'];
-      if (l.includes('firm') || l.includes('auditor')) return [label, "Auditor's firm", '2', '1'];
-      return [label]; // unknown — try as-is
-    };
+    // labelToEnumGuesses was used by the old setProperty-based radio fallback,
+    // which was the source of the "always picks last option" bug. The new
+    // setRadio refuses to setProperty-with-literal-label, so this helper is no
+    // longer referenced. Kept as a comment for archaeological reference.
+    // const labelToEnumGuesses = (label: string): string[] => { ... };
 
     /** Read back the model value after a setProperty. */
     const readModelValue = (som: string): string | null => {
@@ -1802,8 +2403,127 @@ async function _applyDirectOverrides(
     };
 
     const setRadio = (_node: GuideNode, som: string, valueLabel: string, fieldName: string): { ok: boolean; reason: string; finalValue?: string } => {
-      // Strategy 1: walk ALL radio inputs in the document and find the one whose
-      // ancestor element (any depth) has an id containing the field name.
+      // ═══════════════════════════════════════════════════════════════════════
+      // PRIMARY: AEM option-list lookup. The node's `options` (or
+      // `jsonModel.options`) array is the form-designer-configured list of
+      // {value, label} pairs that the option-matcher checks against on save.
+      // Find the option whose label === the desired visible label, then write
+      // that option's `value` (the REAL internal enum) and click the DOM radio
+      // whose `.value` attribute matches it.
+      // ═══════════════════════════════════════════════════════════════════════
+      const nodeOpts = ((_node as unknown as { options?: Array<{ value: unknown; label?: string; text?: string }>; jsonModel?: { options?: Array<{ value: unknown; label?: string; text?: string }> } }).options
+                     ?? (_node as unknown as { jsonModel?: { options?: Array<{ value: unknown; label?: string; text?: string }> } }).jsonModel?.options
+                     ?? []);
+      if (Array.isArray(nodeOpts) && nodeOpts.length > 0) {
+        const wantOptNorm = valueLabel.trim().toLowerCase();
+        const matched = nodeOpts.find(o => {
+          const lbl = String((o.label ?? o.text ?? '')).replace(/\s+/g, ' ').trim().toLowerCase();
+          return lbl === wantOptNorm;
+        });
+        if (matched) {
+          const realValue = String(matched.value);
+          const canonicalLabel = String(matched.label ?? matched.text ?? valueLabel);
+          // ALL MCA radios in a group have html `value="on"` — so we can't
+          // identify the right one by `.value`. Find the radio group via
+          // ancestor id, then pick the radio whose VISIBLE LABEL matches
+          // (or, last resort, the radio at the option's INDEX in the AEM
+          // options array).
+          const allRadios = Array.from(document.querySelectorAll<HTMLInputElement>('input[type="radio"]'));
+          const fLower = fieldName.toLowerCase();
+          const groupRadios: HTMLInputElement[] = [];
+          for (const r of allRadios) {
+            let el: HTMLElement | null = r;
+            while (el) {
+              if (el.id && el.id.toLowerCase().includes(fLower)) { groupRadios.push(r); break; }
+              el = el.parentElement;
+            }
+          }
+          const collectPrimary2 = (r: HTMLInputElement): string => {
+            const lc = (s: string | null | undefined): string =>
+              String(s ?? '').replace(/\s+/g, ' ').trim().toLowerCase();
+            if (r.id) {
+              const lbl = document.querySelector<HTMLLabelElement>(`label[for="${CSS.escape(r.id)}"]`);
+              const t = lc(lbl?.textContent);
+              if (t) return t;
+            }
+            const wrap = r.closest('label');
+            if (wrap) {
+              const direct = Array.from(wrap.childNodes)
+                .filter(nd => nd.nodeType === Node.TEXT_NODE)
+                .map(nd => nd.textContent ?? '')
+                .join(' ');
+              const t = lc(direct) || lc(wrap.textContent);
+              if (t) return t;
+            }
+            let nx: Node | null = r.nextSibling;
+            while (nx && nx.nodeType === Node.TEXT_NODE && !(nx.textContent ?? '').trim()) nx = nx.nextSibling;
+            if (nx && nx.nodeType === Node.TEXT_NODE) {
+              const t = lc(nx.textContent);
+              if (t) return t;
+            }
+            if (r.nextElementSibling) {
+              const raw = r.nextElementSibling.textContent ?? '';
+              if (raw.length <= 30) {
+                const t = lc(raw);
+                if (t) return t;
+              }
+            }
+            const aria = lc(r.getAttribute('aria-label'));
+            if (aria) return aria;
+            return '';
+          };
+          const primaries = groupRadios.map(r => collectPrimary2(r));
+          const wantOptNorm = canonicalLabel.replace(/\s+/g, ' ').trim().toLowerCase();
+          let chosen = primaries.findIndex(p => p === wantOptNorm);
+          if (chosen === -1) {
+            const re = new RegExp(`(^|[^a-z])${wantOptNorm.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}($|[^a-z])`);
+            chosen = primaries.findIndex(p => re.test(p));
+          }
+          if (chosen === -1) {
+            // Last resort: match by INDEX in AEM's options array
+            const optIdx = nodeOpts.findIndex(o => {
+              const lbl = String(o.label ?? o.text ?? '').replace(/\s+/g, ' ').trim().toLowerCase();
+              return lbl === wantOptNorm;
+            });
+            if (optIdx !== -1 && optIdx < groupRadios.length) chosen = optIdx;
+          }
+          let domClicked = false;
+          if (chosen !== -1 && chosen < groupRadios.length) {
+            const target = groupRadios[chosen];
+            for (const sib of groupRadios) {
+              if (sib !== target && sib.name === target.name) sib.checked = false;
+            }
+            target.scrollIntoView({ block: 'center' });
+            target.checked = true;
+            try { target.click(); } catch { /* */ }
+            target.dispatchEvent(new Event('input', { bubbles: true }));
+            target.dispatchEvent(new Event('change', { bubbles: true }));
+            target.dispatchEvent(new Event('blur', { bubbles: true }));
+            domClicked = true;
+          }
+          try { gb.setProperty([som], 'value', [realValue]); } catch { /* */ }
+          const after = readModelValue(som);
+          return {
+            ok: domClicked,
+            reason: `AEM-option-list: "${valueLabel}" → label="${canonicalLabel}" value="${realValue}"; DOM-click=${domClicked ? `idx${chosen} of ${groupRadios.length}` : `FAIL (primaries=${JSON.stringify(primaries)})`}; model="${after}"`,
+            finalValue: realValue,
+          };
+        }
+        // Options exist but label didn't match — surface the available options
+        // in the failure reason so we can correct the schema label or the
+        // matcher.
+        const optionsDump = nodeOpts.map(o => ({ value: o.value, label: o.label ?? o.text }));
+        return {
+          ok: false,
+          reason: `AEM-option-list had ${nodeOpts.length} options but none matched "${valueLabel}". Options: ${JSON.stringify(optionsDump)}`,
+        };
+      }
+
+      // ═══════════════════════════════════════════════════════════════════════
+      // FALLBACK: no AEM options exposed on the node — locate by ancestor id
+      // and click by per-radio primary label (existing logic).
+      // ═══════════════════════════════════════════════════════════════════════
+      // ─── Locate the radio group by AEM field name in any ancestor id ───
       const fieldLower = fieldName.toLowerCase();
       const allRadios = Array.from(document.querySelectorAll<HTMLInputElement>('input[type="radio"]'));
       const radios: HTMLInputElement[] = [];
@@ -1816,7 +2536,6 @@ async function _applyDirectOverrides(
         }
         if (matched) radios.push(r);
       }
-      // Strategy 2: by name attribute
       if (radios.length === 0) {
         for (const r of allRadios) {
           if ((r.name ?? '').toLowerCase().includes(fieldLower) || (r.id ?? '').toLowerCase().includes(fieldLower)) {
@@ -1824,85 +2543,119 @@ async function _applyDirectOverrides(
           }
         }
       }
-
-      // No DOM radios — fall back to setProperty with verification
       if (radios.length === 0) {
-        const guesses = labelToEnumGuesses(valueLabel);
-        for (const guess of guesses) {
-          try { gb.setProperty([som], 'value', [guess]); } catch { continue; }
-          const after = readModelValue(som);
-          if (after === guess || (after != null && labelMatches(after, valueLabel))) {
-            return { ok: true, reason: `setProperty-verified: "${guess}" persisted (model="${after}")`, finalValue: guess };
-          }
-        }
-        return { ok: false, reason: `no DOM radios + setProperty rejected all guesses [${labelToEnumGuesses(valueLabel).join(',')}] (model still: ${readModelValue(som)})` };
+        // Refuse to fall back to setProperty-with-literal-label: that was the
+        // source of the "always picks last option" bug (model accepts the
+        // string "Yes" but MCA's option-matcher doesn't have "Yes" in its enum
+        // list, so the visible widget falls back to the default — usually the
+        // last option). Fail loudly so we know to investigate.
+        return {
+          ok: false,
+          reason: `no DOM radios found for field "${fieldName}" — neither id-substring nor name-substring matched. Refusing to setProperty (writes literal label, MCA defaults to last option).`,
+        };
       }
 
-      const collectLabels = (r: HTMLInputElement): string[] => {
-        const out: string[] = [];
+      // ─── Per-radio PRIMARY LABEL — uniquely identifies one radio in the group.
+      // Excludes parentElement.textContent because in rows like
+      //   <div>Yes <input> No <input></div>
+      // it contains all option labels and would let either radio match either
+      // option, silently inverting the user's selection.
+      const collectPrimaryLabel = (r: HTMLInputElement): string => {
+        const norm = (s: string | null | undefined): string =>
+          String(s ?? '').replace(/\s+/g, ' ').trim().toLowerCase();
+        // 1. <label for=id>
         if (r.id) {
           const lbl = document.querySelector<HTMLLabelElement>(`label[for="${CSS.escape(r.id)}"]`);
-          if (lbl?.textContent) out.push(lbl.textContent);
+          const t = norm(lbl?.textContent);
+          if (t) return t;
         }
-        const parentLabel = r.closest('label');
-        if (parentLabel?.textContent) out.push(parentLabel.textContent);
-        // Next-sibling text node (common AEM rendering)
-        if (r.nextSibling?.nodeType === Node.TEXT_NODE) {
-          const t = r.nextSibling.textContent;
-          if (t) out.push(t);
+        // 2. Wrapping <label> — only its DIRECT text nodes (not nested children)
+        const wrap = r.closest('label');
+        if (wrap) {
+          const direct = Array.from(wrap.childNodes)
+            .filter(n => n.nodeType === Node.TEXT_NODE)
+            .map(n => n.textContent ?? '')
+            .join(' ');
+          const t = norm(direct) || norm(wrap.textContent);
+          if (t) return t;
         }
-        // Next-sibling element
-        if (r.nextElementSibling?.textContent) out.push(r.nextElementSibling.textContent);
-        const aria = r.getAttribute('aria-label');
-        if (aria) out.push(aria);
-        if (r.value) out.push(r.value);
-        return out;
+        // 3. Immediate next text-sibling
+        let nx: Node | null = r.nextSibling;
+        while (nx && nx.nodeType === Node.TEXT_NODE && !(nx.textContent ?? '').trim()) nx = nx.nextSibling;
+        if (nx && nx.nodeType === Node.TEXT_NODE) {
+          const t = norm(nx.textContent);
+          if (t) return t;
+        }
+        // 4. Immediate next element-sibling (only if short)
+        if (r.nextElementSibling) {
+          const raw = r.nextElementSibling.textContent ?? '';
+          if (raw.length <= 30) {
+            const t = norm(raw);
+            if (t) return t;
+          }
+        }
+        // 5. aria-label
+        const aria = norm(r.getAttribute('aria-label'));
+        if (aria) return aria;
+        // 6. value attribute (last resort, often "on" — useless but not wrong)
+        return norm(r.value);
       };
 
-      const sampledLabels: Array<{ idx: number; value: string; labels: string[] }> = [];
-      for (let i = 0; i < radios.length; i++) {
-        const r = radios[i];
-        const labels = collectLabels(r);
-        sampledLabels.push({ idx: i, value: r.value, labels });
-        if (labels.some(l => labelMatches(l, valueLabel))) {
-          // Match found — fire EVERYTHING: setProperty model, set checked, click, all events
-          try { gb.setProperty([som], 'value', [r.value]); } catch { /* */ }
-          // Uncheck all siblings in the same radio group first
-          for (const sib of radios) {
-            if (sib !== r && sib.name === r.name) sib.checked = false;
-          }
-          r.checked = true;
-          try { r.click(); } catch { /* some browsers throw if click is intercepted */ }
-          r.dispatchEvent(new Event('input',  { bubbles: true }));
-          r.dispatchEvent(new Event('change', { bubbles: true }));
-          r.dispatchEvent(new Event('blur',   { bubbles: true }));
-          // Verify the model accepted it
-          const after = readModelValue(som);
-          if (after === r.value || (after != null && labelMatches(after, valueLabel))) {
-            return { ok: true, reason: `clicked radio[${i}] value="${r.value}" matched "${labels[0] || '?'}", model="${after}"`, finalValue: r.value };
-          }
-          // DOM click didn't stick — try alternate enum values
-          for (const guess of labelToEnumGuesses(valueLabel)) {
-            try { gb.setProperty([som], 'value', [guess]); } catch { continue; }
-            const after2 = readModelValue(som);
-            if (after2 === guess) {
-              return { ok: true, reason: `clicked + setProperty-fallback "${guess}" (after click model was "${after}")`, finalValue: guess };
-            }
-          }
-          return { ok: false, reason: `clicked radio[${i}] but model didn't persist (model="${after}", expected one of ${labelToEnumGuesses(valueLabel).join('|')})` };
+      const wantOpt = valueLabel.trim().toLowerCase();
+      const optionMatches = (primary: string): boolean => {
+        if (!primary) return false;
+        if (primary === wantOpt) return true;
+        // Word-boundary match: "no" must not match "not applicable", "yes" must
+        // not match "yes/no".
+        const re = new RegExp(`(^|[^a-z])${wantOpt.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}($|[^a-z])`);
+        return re.test(primary);
+      };
+
+      const primaries: string[] = radios.map(r => collectPrimaryLabel(r));
+      const sampled = radios.map((r, i) => ({ idx: i, value: r.value, primary: primaries[i].slice(0, 40) }));
+
+      // Strictest match: primary === wantOpt
+      let chosen = primaries.findIndex(p => p === wantOpt);
+      let matchReason = `primary === "${wantOpt}"`;
+      // Fallback: word-boundary match
+      if (chosen === -1) {
+        chosen = primaries.findIndex(p => optionMatches(p));
+        matchReason = `word-boundary match on "${wantOpt}"`;
+      }
+      // Ambiguity guard — multiple radios match by word boundary AND none is
+      // an exact match. Refuse to guess.
+      if (chosen !== -1 && primaries[chosen] !== wantOpt) {
+        const allMatches = primaries.filter(p => optionMatches(p)).length;
+        if (allMatches > 1) {
+          return {
+            ok: false,
+            reason: `${allMatches} radios matched "${valueLabel}" by word-boundary — ambiguous, refusing to guess. Primaries: ${JSON.stringify(primaries)}`,
+          };
         }
       }
-      // Nothing matched by label. Last-ditch: try setProperty with enum guesses.
-      for (const guess of labelToEnumGuesses(valueLabel)) {
-        try { gb.setProperty([som], 'value', [guess]); } catch { continue; }
-        const after = readModelValue(som);
-        if (after === guess) {
-          return { ok: true, reason: `no label-match radio; setProperty "${guess}" worked (model="${after}")`, finalValue: guess };
-        }
+      if (chosen === -1) {
+        return {
+          ok: false,
+          reason: `no radio's primary label matched "${valueLabel}". Sampled: ${JSON.stringify(sampled)}`,
+        };
       }
+
+      const r = radios[chosen];
+      // Uncheck all siblings in the same radio group first
+      for (const sib of radios) {
+        if (sib !== r && sib.name === r.name) sib.checked = false;
+      }
+      r.scrollIntoView({ block: 'center' });
+      r.checked = true;
+      try { r.click(); } catch { /* */ }
+      r.dispatchEvent(new Event('input',  { bubbles: true }));
+      r.dispatchEvent(new Event('change', { bubbles: true }));
+      r.dispatchEvent(new Event('blur',   { bubbles: true }));
+      const after = readModelValue(som);
       return {
-        ok: false,
-        reason: `no radio label matched "${valueLabel}" + setProperty rejected. Sampled: ${JSON.stringify(sampledLabels.map(s => ({ v: s.value, l: s.labels[0]?.trim()?.slice(0, 30) })))}, model=${readModelValue(som)}`,
+        ok: true,
+        reason: `clicked radio[${chosen}] value="${r.value}" primary="${primaries[chosen]}" (${matchReason}); model="${after}"`,
+        finalValue: r.value,
       };
     };
 
@@ -1969,6 +2722,38 @@ async function _applyDirectOverrides(
       let r: { ok: boolean; reason: string; finalValue?: string };
       if (widgetType === 'radio')        r = setRadio(node, node.somExpression, strVal, name);
       else if (widgetType === 'dropdown') r = setDropdown(node, node.somExpression, strVal, name);
+      else if (widgetType === 'date') {
+        // AEM DatePicker model storage is ISO yyyy-mm-dd; the widget's visible
+        // text input shows DD/MM/YYYY. Writing the display format to the model
+        // triggers MCA's "not supported format" validator. So:
+        //   1. setProperty with ISO (the form supplies yyyy-mm-dd here).
+        //   2. ALSO poke the underlying DOM text input with DD/MM/YYYY so the
+        //      widget's onBlur reformat doesn't undo our setProperty.
+        //   3. Fire input/change/blur on the input so AEM's binding sees it.
+        const iso = (/^\d{4}-\d{2}-\d{2}/.exec(strVal) || [])[0] || strVal;
+        const m = iso.match(/^(\d{4})-(\d{2})-(\d{2})/);
+        const display = m ? `${m[3]}/${m[2]}/${m[1]}` : strVal;
+        try { gb.setProperty([node.somExpression], 'value', [iso]); } catch { /* */ }
+        // Try to find the visible date input and fill it
+        const fieldLower = name.toLowerCase();
+        let input: HTMLInputElement | null = null;
+        for (const inp of Array.from(document.querySelectorAll<HTMLInputElement>('input[type="text"], input[type="date"], input:not([type])'))) {
+          let el: HTMLElement | null = inp;
+          while (el) {
+            if (el.id && el.id.toLowerCase().includes(fieldLower)) { input = inp; break; }
+            el = el.parentElement;
+          }
+          if (input) break;
+        }
+        if (input) {
+          input.value = display;
+          input.dispatchEvent(new Event('input',  { bubbles: true }));
+          input.dispatchEvent(new Event('change', { bubbles: true }));
+          input.dispatchEvent(new Event('blur',   { bubbles: true }));
+        }
+        const after = readModelValue(node.somExpression);
+        r = { ok: !!after, reason: `date set: model="${after}" display="${display}" input=${input ? 'filled' : 'not-found'}`, finalValue: after ?? iso };
+      }
       else {
         try {
           gb.setProperty([node.somExpression], 'value', [strVal]);

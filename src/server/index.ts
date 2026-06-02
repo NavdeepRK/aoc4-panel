@@ -453,6 +453,19 @@ const server = http.createServer(async (req, res) => {
 
 server.listen(PORT, () => {
   process.stderr.write(`[mca-filing-service] listening on :${PORT} — artifacts → ${ARTIFACT_ROOT}\n`);
+  // Session-reuse env-var presence check. We print only "set"/"NOT SET" — never the
+  // secret value — so SPOCs can verify config without leaking keys to logs.
+  process.stderr.write(
+    `[mca-filing-service] session save-back env: ` +
+    `PORTAL_BACKEND_URL=${process.env.PORTAL_BACKEND_URL ? 'set' : 'NOT SET'} ` +
+    `SYSTEM_AUTH_TOKEN=${process.env.SYSTEM_AUTH_TOKEN ? 'set' : 'NOT SET'}\n`,
+  );
+  if (!process.env.PORTAL_BACKEND_URL || !process.env.SYSTEM_AUTH_TOKEN) {
+    process.stderr.write(
+      `[mca-filing-service] WARN: per-SPOC session save-back DISABLED — every trigger will require login. ` +
+      `Set PORTAL_BACKEND_URL and SYSTEM_AUTH_TOKEN to enable.\n`,
+    );
+  }
   // Hydrate jobs persisted to disk from prior runs so /jobs/:id/status + /pdf keep working
   // across restarts. Live actions (upload-signed, force-download-pdf) still require a browser
   // and will fail with a clear "service was restarted" error if attempted on a stale job.
