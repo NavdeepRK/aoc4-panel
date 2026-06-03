@@ -1341,23 +1341,27 @@ async function _applyGenericPanelFill(
               if (v && v !== '') { setVal(n.somExpression, v); ddCount++; wrote = v; break; }
             }
           } else if (/TextBox|TextField|NumericBox/i.test(cls)) {
-            // Field name → value heuristic. The previous fallback to 'NA' for unrecognised
-            // names produced incorrect output: balance-sheet rows showed "NA" in the live
-            // form where the PDF had "0" (SPOC complaint 2026-05-18).
+            // Default every empty value field to '0' UNLESS its name clearly marks
+            // it as free text. Rationale (SPOC complaint 2026-06): whole numeric
+            // tables — Part III Financial parameters (fp*), E trade-receivables
+            // break-up (bte*), IV share-capital-raised (sc*) — were left BLANK on
+            // MCA because their field names don't match a numeric-ending heuristic
+            // and they're rendered as plain TextBoxes (not NumericBox). MCA wants a
+            // figure (0) in every such cell, not an empty box.
             //
-            // Better default:
-            //   - Numeric-looking name (Current/Previous/Total/Amount/etc.) OR a NumericBox
-            //     widget → '0.00' (or '0' depending on width)
-            //   - True text fields (name/address) → leave EMPTY (don't write 'NA' which the
-            //     PDF would then carry forward as a literal value)
-            const treatAsNumeric = /NumericBox/i.test(cls) || isNumericName(n.name);
+            // So we INVERT the rule: numeric by default, text only when the name
+            // clearly indicates free text (name/address/PAN/CIN/SRN/DIN/reason/etc.).
+            // This never writes '0' into a genuine identity/text field, but does
+            // zero every financial cell we have no value for.
+            const isTextName = (name?: string): boolean =>
+              !!name && /(name|address|line\s*[12]|descr|reason|remark|particular|nature|email|firm|auditor|director|secretary|manager|place|city|district|state|country|pin\s*code|pincode|^pan|\bpan\b|cin|srn|\bdin\b|membership|category|registration|website|url|comment|note)/i.test(name);
+            const treatAsNumeric = /NumericBox/i.test(cls) || isNumericName(n.name) || !isTextName(n.name);
             if (treatAsNumeric) {
               setVal(n.somExpression, '0');
               numericCount++;
               wrote = '0';
             } else {
-              // Skip — leave blank. Worth re-visiting once we have a verified list of
-              // text fields that genuinely require some non-empty value to save.
+              // Genuine text field with no value — leave blank (don't write '0'/'NA').
             }
           }
         }
