@@ -576,23 +576,58 @@ export async function runAoc4Job(job: Aoc4Job, opts: { artifactDir: string; skip
   }
   log('session OK — form URL loaded');
 
-  // waitForBridge with a descriptive error on timeout (e.g. session expired mid-load)
-  await waitForBridge(page, 30_000).catch(async (e: unknown) => {
-    const currentUrl = page.url();
-    const onLogin =
-      currentUrl.includes('fologin') ||
-      currentUrl.includes('/login') ||
-      currentUrl.includes('login.html');
-    await browser.close().catch(() => {});
-    const hint = onLogin
-      ? 'Redirected to login page — session expired. Run `npm run login` and retry.'
-      : `guideBridge did not load within 30 s (URL: ${currentUrl}). The form may have changed.`;
-    throw Object.assign(new Error(hint), { cause: e });
-  });
+  // Wait for the AEM Adaptive Form runtime (guideBridge) to fully initialise.
+  // MCA's form pulls its JS bundles + form-definition JSON over many requests;
+  // from a datacenter IP / under MCA load, the old fixed 30 s was often too tight.
+  //
+  // Now: timeout is configurable via FORM_READY_TIMEOUT_MS (default 60 s), and we
+  // retry ONCE with a full page reload before giving up — most "did not load"
+  // failures are just a slow first load that a reload clears. On every failure we
+  // capture a screenshot + HTML so a genuine "form changed / blocked" case can be
+  // told apart from "MCA was slow" (instead of guessing from the timeout text).
+  const bridgeTimeout = Number(process.env.FORM_READY_TIMEOUT_MS) || 60_000;
+  const isOnLoginUrl = () => {
+    const u = page.url();
+    return u.includes('fologin') || u.includes('/login') || u.includes('login.html');
+  };
 
+  let bridgeReady = false;
+  for (let attempt = 1; attempt <= 2 && !bridgeReady; attempt++) {
+    try {
+      await waitForBridge(page, bridgeTimeout);
+      bridgeReady = true;
+    } catch (e) {
+      // Session died mid-load → bounced to login. No point retrying.
+      if (isOnLoginUrl()) {
+        await _capturePageState(page, opts.artifactDir, 'form-redirected-to-login', log);
+        await browser.close().catch(() => {});
+        throw Object.assign(
+          new Error('Redirected to login page — session expired. Run `npm run login` and retry.'),
+          { cause: e },
+        );
+      }
+      if (attempt < 2) {
+        log(`guideBridge not ready after ${bridgeTimeout}ms (attempt ${attempt}/2) — reloading the form and retrying once`);
+        await _capturePageState(page, opts.artifactDir, `form-bridge-timeout-attempt${attempt}`, log);
+        await page.reload({ waitUntil: 'domcontentloaded', timeout: 45_000 }).catch(() => {});
+        await page.waitForTimeout(2500);
+      } else {
+        await _capturePageState(page, opts.artifactDir, 'form-bridge-timeout-final', log);
+        await browser.close().catch(() => {});
+        throw Object.assign(
+          new Error(`guideBridge did not load within ${bridgeTimeout}ms after 2 attempts (URL: ${page.url()}). MCA was slow or the AOC-4 form changed — see artifact png/html.`),
+          { cause: e },
+        );
+      }
+    }
+  }
+
+  // The form's encrypt() helper + CSRF token must also be present before we save.
+  // Share the same (configurable) budget — these become available right after the
+  // bridge connects, so this rarely waits long once guideBridge is up.
   await page.waitForFunction(
     () => typeof (window as unknown as { encrypt?: unknown }).encrypt === 'function' && !!document.querySelector('#csrfToken'),
-    { timeout: 30_000 },
+    { timeout: bridgeTimeout },
   );
 
   // Pre-prime the form's draftID before any save. Without this, each save creates a

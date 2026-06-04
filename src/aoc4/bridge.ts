@@ -300,7 +300,10 @@ export async function saveAndAdvance(
 ): Promise<SaveAndAdvanceResult> {
   const requireValid = opts.requireValid ?? true;
   const advance = opts.advance ?? false;
-  const timeoutMs = opts.timeoutMs ?? 30_000;
+  // How long to wait for MCA's /bin/commonSaveSubmit response after clicking Save.
+  // Explicit per-call value wins; otherwise SAVE_TIMEOUT_MS env, else 30 s. MCA's
+  // save round-trip can be slow under load, so this is tunable without a code change.
+  const timeoutMs = opts.timeoutMs ?? (Number(process.env.SAVE_TIMEOUT_MS) || 30_000);
   const notes: string[] = [];
 
   // 1. Pre-save validation
