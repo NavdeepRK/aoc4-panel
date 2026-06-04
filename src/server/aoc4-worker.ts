@@ -45,7 +45,7 @@ import { AOC4_FORM_URL, waitForBridge } from '../aoc4/bridge.js';
 import { setPhase, type Aoc4Job, deferred } from './jobs.js';
 import { submitCredentials, observe } from '../login.js';
 import { autoSolveCaptcha } from '../captcha.js';
-import { URLS, LOGIN, REGISTER } from '../selectors.js';
+import { URLS, LOGIN, SESSION_CONFLICT } from '../selectors.js';
 
 const SR_ID_REGEX = /\[Id\]\s*=\s*"([0-9A-Z\-]+)"/;
 // Match both 'Submitted By is a required field' and quoted variants like
@@ -113,6 +113,33 @@ async function _postStorageStateBack(
 }
 
 /**
+ * Capture a screenshot + full HTML of the current page into the job's artifact
+ * dir. Best-effort: never throws. Used when login fails (e.g. the username field
+ * never renders within 20s) so we can SEE what MCA actually served — the real
+ * login form, an Akamai "Access Denied" block page, a captcha, a maintenance
+ * notice, or the session-conflict modal — instead of guessing from a bare
+ * "waitForSelector: Timeout 20000ms exceeded" message.
+ */
+async function _capturePageState(
+  page: import('playwright').Page,
+  artifactDir: string,
+  label: string,
+  log: (m: string) => void,
+): Promise<void> {
+  try {
+    const safe = label.replace(/[^a-z0-9_-]+/gi, '_').slice(0, 60);
+    const pngPath = path.join(artifactDir, `${safe}.png`);
+    const htmlPath = path.join(artifactDir, `${safe}.html`);
+    await page.screenshot({ path: pngPath, fullPage: true }).catch(() => {});
+    const html = await page.content().catch(() => '');
+    if (html) fs.writeFileSync(htmlPath, html);
+    log(`captured page state → ${safe}.png / ${safe}.html (url=${page.url()})`);
+  } catch (e) {
+    log(`page-state capture failed: ${(e as Error).message}`);
+  }
+}
+
+/**
  * MCA sometimes shows a "This account is already logged in somewhere else.
  * Do you want to continue?" dialog right after credentials are accepted (and
  * occasionally during OTP flow). Auto-click Yes/Continue so the worker doesn't
@@ -123,7 +150,27 @@ async function _postStorageStateBack(
  */
 async function _dismissAlreadyLoggedInPopup(page: import('playwright').Page): Promise<boolean> {
   try {
-    // The dialog text varies. Match on any of MCA's known phrasings.
+    // 0. MOST RELIABLE: the YES button on the session-conflict modal, targeted by
+    //    its stable author class `killSession` (confirmed live 2026-06-04), then by
+    //    known id, then by aria-label scoped to the modal. "Yes" ends the other
+    //    session and continues — exactly what we want. These are tried FIRST and
+    //    are unambiguous vs the NO button (class `okButton`, aria-label "No"), so
+    //    we can never accidentally click NO.
+    for (const sel of [
+      SESSION_CONFLICT.YES_BY_CLASS,
+      SESSION_CONFLICT.YES_BTN,
+      `${SESSION_CONFLICT.MODAL} ${SESSION_CONFLICT.YES_BY_ARIA}`,
+      SESSION_CONFLICT.YES_BY_ARIA,
+    ]) {
+      const btn = page.locator(sel).first();
+      if (await btn.count() > 0 && await btn.isVisible().catch(() => false)) {
+        await btn.click({ timeout: 3000, force: true });
+        return true;
+      }
+    }
+
+    // The dialog text varies. Match on any of MCA's known phrasings. If neither the
+    // YES button above nor any known phrasing is present, there's no popup to dismiss.
     // Confirmed live phrasings:
     //   "You already have an active session. Logging in here again will end that session. Do you want to continue?"
     //   "This account is already logged in somewhere else. Do you want to continue here?"
@@ -132,14 +179,7 @@ async function _dismissAlreadyLoggedInPopup(page: import('playwright').Page): Pr
       .first();
     if (await dialogText.count() === 0) return false;
 
-    // 0a. Known stable AEM component ID for YES on the session-conflict modal.
-    const aemYesBtn = page.locator(REGISTER.YES_BTN);
-    if (await aemYesBtn.count() > 0 && await aemYesBtn.isVisible().catch(() => false)) {
-      await aemYesBtn.click({ timeout: 3000, force: true });
-      return true;
-    }
-
-    // 0b. Broad AEM modal pattern: any button whose id contains "modal_container"
+    // 0c. Broad AEM modal pattern: any button whose id contains "modal_container"
     //     AND whose text is an affirmative word. Covers any variant modal container
     //     MCA may use now or in future (modal_container_copy, modal_container_copy_984..., etc.)
     const aemModalBtns = await page
@@ -306,7 +346,12 @@ export async function runAoc4Job(job: Aoc4Job, opts: { artifactDir: string; skip
     // ─── Fresh per-SPOC login flow ───────────────────────────────────────────
     log('per-job login: navigating to MCA login page');
     await page.goto(URLS.LOGIN, { waitUntil: 'domcontentloaded', timeout: 45_000 });
-    await page.waitForSelector(LOGIN.USER_ID, { state: 'visible', timeout: 20_000 }).catch(() => {});
+    await page.waitForSelector(LOGIN.USER_ID, { state: 'visible', timeout: 20_000 }).catch(async () => {
+      // The username field never rendered — MCA likely served a block/maintenance/
+      // captcha page instead of the login form. Capture it so we can tell which.
+      await _capturePageState(page, opts.artifactDir, 'login-page-no-userid-field', log);
+      log('WARNING: username field not visible 20s after navigating to login page — see artifact png/html');
+    });
 
     // Set up the creds + otp signal deferreds so the HTTP endpoints can resolve them.
     const credsSignal = deferred<{ userId: string; password: string }>();
@@ -325,7 +370,15 @@ export async function runAoc4Job(job: Aoc4Job, opts: { artifactDir: string; skip
 
     setPhase(jobId, 'LOGGING_IN_CREDS');
     log(`submitting credentials for userId=${creds.userId}`);
-    await submitCredentials(page, creds);
+    try {
+      await submitCredentials(page, creds);
+    } catch (e) {
+      // submitCredentials throws if the login form never rendered (the exact
+      // "waitForSelector: Timeout ... guidetextbox___widget" failure). Capture
+      // the page so we can see what MCA served instead of the login form.
+      await _capturePageState(page, opts.artifactDir, 'login-form-did-not-load', log);
+      throw new Error(`MCA login form did not load (the username field never appeared) — likely a bot-block / maintenance / changed-selector page. See artifact png/html. Original: ${(e as Error).message}`);
+    }
 
     // Poll for the next state — could be OTP step, invalid creds, captcha,
     // OR the "already logged in elsewhere" interstitial. Auto-dismiss the
@@ -458,7 +511,8 @@ export async function runAoc4Job(job: Aoc4Job, opts: { artifactDir: string; skip
     }
 
     if (postLoginObs.step !== 'logged-in') {
-      const msg = `login did not reach logged-in state (last step: ${postLoginObs.step})`;
+      await _capturePageState(page, opts.artifactDir, `login-stalled-${postLoginObs.step}`, log);
+      const msg = `login did not reach logged-in state (last step: ${postLoginObs.step}) — see artifact png/html`;
       log(msg);
       setPhase(jobId, 'FAILED', { error: msg });
       await browser.close().catch(() => {});

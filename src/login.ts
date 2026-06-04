@@ -1,5 +1,5 @@
 import type { Page } from 'playwright';
-import { LOGIN, URLS } from './selectors.js';
+import { LOGIN, URLS, SESSION_CONFLICT } from './selectors.js';
 import { CAPTCHA, isCaptchaVisible, autoSolveCaptcha } from './captcha.js';
 
 export interface LoginCredentials {
@@ -60,6 +60,30 @@ export async function observe(page: Page): Promise<LoginObservation> {
     return { step: 'invalid-credentials', url, errorMessage: errorMsg.trim() };
   }
 
+  // "Already logged in elsewhere" / session-conflict modal — MUST be detected
+  // BEFORE the otp / logged-in / login-form checks below.
+  //
+  // Why first: MCA renders this as an overlay while (a) the login form stays in
+  // the DOM (so LOGIN.USER_ID.isVisible() is still true → would mis-report
+  // 'login-form') and (b) partial auth cookies are sometimes ALREADY set (so the
+  // cookie fallback would mis-report 'logged-in'). Either misread makes the
+  // worker skip clicking "Yes", the session is never finalised, and the whole
+  // flow stalls. Gate on the modal first so it's always handled.
+  //
+  // Primary signal: the YES button's stable author class `killSession` is
+  // visible. Fallback: the known dialog phrasings.
+  const conflictYesVisible = await page
+    .locator(SESSION_CONFLICT.YES_BY_CLASS)
+    .first()
+    .isVisible()
+    .catch(() => false);
+  const conflictTextVisible = conflictYesVisible ? false : await page
+    .locator('text=/already\\s*(logged\\s*in|have\\s*an)|active\\s*session|end\\s*that\\s*session|logging\\s*in\\s*here\\s*again/i')
+    .first()
+    .isVisible()
+    .catch(() => false);
+  if (conflictYesVisible || conflictTextVisible) return { step: 'session-conflict', url };
+
   const otpVisible = await page
     .getByText(/one\s*time\s*password|enter\s*otp|verify\s*otp/i)
     .first()
@@ -90,17 +114,6 @@ export async function observe(page: Page): Promise<LoginObservation> {
   if (hasAuth) {
     return { step: 'logged-in', url };
   }
-
-  // "Already logged in elsewhere" / session conflict modal.
-  // MUST be checked BEFORE login-form: MCA renders this as an overlay while the
-  // login form stays in the DOM, so LOGIN.USER_ID.isVisible() still returns true
-  // and would incorrectly report 'login-form', confusing the entire login flow.
-  const sessionConflict = await page
-    .locator('text=/already\\s*(logged\\s*in|have\\s*an)|active\\s*session|end\\s*that\\s*session|logging\\s*in\\s*here\\s*again/i')
-    .first()
-    .isVisible()
-    .catch(() => false);
-  if (sessionConflict) return { step: 'session-conflict', url };
 
   // Login form still showing
   const userIdVisible = await page.locator(LOGIN.USER_ID).isVisible().catch(() => false);

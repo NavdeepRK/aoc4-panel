@@ -42,3 +42,23 @@ export const REGISTER = {
   NO_BTN: '#guideContainer-rootPanel-modal_container_copy-nextitemnav_copy___widget',
   CONTINUE_BTN: '#guideContainer-rootPanel-modal_container_copy_984288898-nextitemnav_copy___widget',
 } as const;
+
+/**
+ * "You already have an active session. Logging in here again will end that
+ * session. Do you want to continue?" modal on the MCA V3 login screen.
+ * Confirmed live 2026-06-04 via DOM capture.
+ *
+ * The YES button (continue / end the other session) carries the stable author
+ * class `killSession`; NO carries `okButton`. Prefer the class-based selector —
+ * an author-assigned class survives AEM re-id'ing far better than the
+ * auto-generated `modal_container_copy-...` panel id, and — critically — it
+ * cannot be confused with the NO button (the two ids differ by a single `_cop`).
+ */
+export const SESSION_CONFLICT = {
+  MODAL:        '#guideContainer-rootPanel-modal_container_copy__',
+  YES_BY_CLASS: '.killSession button',                                                    // ← preferred
+  YES_BTN:      '#guideContainer-rootPanel-modal_container_copy-nextitemnav_copy_cop___widget',
+  YES_BY_ARIA:  'button[aria-label="Yes"]',
+  NO_BY_CLASS:  '.okButton button',
+  NO_BTN:       '#guideContainer-rootPanel-modal_container_copy-nextitemnav_copy___widget',
+} as const;
