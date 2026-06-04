@@ -45,7 +45,7 @@ import { AOC4_FORM_URL, waitForBridge } from '../aoc4/bridge.js';
 import { setPhase, type Aoc4Job, deferred } from './jobs.js';
 import { submitCredentials, observe } from '../login.js';
 import { autoSolveCaptcha } from '../captcha.js';
-import { URLS, LOGIN } from '../selectors.js';
+import { URLS, LOGIN, REGISTER } from '../selectors.js';
 
 const SR_ID_REGEX = /\[Id\]\s*=\s*"([0-9A-Z\-]+)"/;
 // Match both 'Submitted By is a required field' and quoted variants like
@@ -132,6 +132,27 @@ async function _dismissAlreadyLoggedInPopup(page: import('playwright').Page): Pr
       .first();
     if (await dialogText.count() === 0) return false;
 
+    // 0a. Known stable AEM component ID for YES on the session-conflict modal.
+    const aemYesBtn = page.locator(REGISTER.YES_BTN);
+    if (await aemYesBtn.count() > 0 && await aemYesBtn.isVisible().catch(() => false)) {
+      await aemYesBtn.click({ timeout: 3000, force: true });
+      return true;
+    }
+
+    // 0b. Broad AEM modal pattern: any button whose id contains "modal_container"
+    //     AND whose text is an affirmative word. Covers any variant modal container
+    //     MCA may use now or in future (modal_container_copy, modal_container_copy_984..., etc.)
+    const aemModalBtns = await page
+      .locator('button[id*="modal_container"]')
+      .all();
+    for (const btn of aemModalBtns) {
+      const txt = ((await btn.textContent().catch(() => '')) ?? '').trim();
+      if (/^(yes|continue|ok|proceed|confirm)$/i.test(txt)) {
+        await btn.click({ timeout: 3000, force: true });
+        return true;
+      }
+    }
+
     // 1. Try button by accessible name (Yes / Continue / Proceed / OK / Confirm)
     const yesBtn = page
       .getByRole('button', { name: /^(yes|continue|ok|proceed|confirm|continue\s*here)$/i })
@@ -140,7 +161,7 @@ async function _dismissAlreadyLoggedInPopup(page: import('playwright').Page): Pr
       await yesBtn.click({ timeout: 3000, force: true });
       return true;
     }
-    // 2. Any visible clickable element with that text
+    // 2. Any visible button / link / input with that text
     const fallback = page.locator('button, a, input[type="button"], input[type="submit"]')
       .filter({ hasText: /^\s*(yes|continue|ok|proceed|confirm)\s*$/i })
       .first();
@@ -148,7 +169,7 @@ async function _dismissAlreadyLoggedInPopup(page: import('playwright').Page): Pr
       await fallback.click({ timeout: 3000, force: true });
       return true;
     }
-    // 3. AEM modal buttons sometimes render as <div role="button"> — try generic role match
+    // 3. AEM modal buttons sometimes render as <div role="button">
     const roleBtn = page.locator('[role="button"]')
       .filter({ hasText: /^\s*(yes|continue|ok|proceed|confirm)\s*$/i })
       .first();
@@ -156,18 +177,26 @@ async function _dismissAlreadyLoggedInPopup(page: import('playwright').Page): Pr
       await roleBtn.click({ timeout: 3000, force: true });
       return true;
     }
-    // 4. Last resort: in-page JS click on any element whose textContent equals one of
-    //    the affirmative words inside an element related to the dialog text.
+    // 4. Last resort: in-page JS click — walk ALL elements, find any inside the
+    //    popup container whose text is an affirmative word.
     const clicked = await page.evaluate(() => {
       const txt = /^\s*(yes|continue|ok|proceed|confirm)\s*$/i;
-      // Find any modal/dialog containing the "already-logged-in" phrasings
+      // First try any element whose id contains modal_container
+      const modalBtns = Array.from(document.querySelectorAll<HTMLElement>('[id*="modal_container"]'));
+      for (const b of modalBtns) {
+        if (txt.test((b.textContent ?? '').trim()) || txt.test((b as HTMLInputElement).value ?? '')) {
+          b.click();
+          return true;
+        }
+      }
+      // Then walk the closest popup wrapper
       const wrappers = Array.from(document.querySelectorAll('div, section'))
-        .filter(el => /already\s*logged\s*in|active\s*session|end\s*that\s*session|another\s*session|continue\s*here|logging\s*in\s*here\s*again/i.test(el.textContent ?? ''));
+        .filter(el => /already\s*(logged\s*in|have\s*an)|active\s*session|end\s*that\s*session|another\s*session|logging\s*in\s*here\s*again/i.test(el.textContent ?? ''));
       for (const w of wrappers) {
         const btns = Array.from(w.querySelectorAll<HTMLElement>('button, a, [role="button"], input[type="button"], input[type="submit"]'));
         for (const b of btns) {
           if (txt.test((b.textContent ?? '').trim()) || txt.test((b as HTMLInputElement).value ?? '')) {
-            (b as HTMLElement).click();
+            b.click();
             return true;
           }
         }
@@ -304,14 +333,24 @@ export async function runAoc4Job(job: Aoc4Job, opts: { artifactDir: string; skip
     // shows it after step transitions to otp/logged-in too, and stalling there
     // means the SPOC sees a confused worker.
     let postLoginObs = await observe(page);
-    for (let i = 0; i < 30; i++) {
-      const dismissed = await _dismissAlreadyLoggedInPopup(page);
-      if (dismissed) log(`dismissed "already logged in elsewhere" popup (iter ${i})`);
+    for (let i = 0; i < 40; i++) {
       // Stop polling once we've reached a definitive step
       if (postLoginObs.step === 'otp' || postLoginObs.step === 'logged-in' || postLoginObs.step === 'invalid-credentials' || postLoginObs.step === 'captcha') break;
-      await page.waitForTimeout(500);
+      // session-conflict = "already logged in elsewhere" popup — always try to dismiss
+      if (postLoginObs.step === 'session-conflict' || postLoginObs.step === 'login-form' || postLoginObs.step === 'unknown') {
+        const dismissed = await _dismissAlreadyLoggedInPopup(page);
+        if (dismissed) {
+          log(`dismissed "already logged in elsewhere" popup (iter ${i}) — waiting for MCA to transition`);
+          // Give MCA extra time to process the confirmation and show captcha/OTP/home
+          await page.waitForTimeout(3000);
+        } else {
+          await page.waitForTimeout(500);
+        }
+      }
       postLoginObs = await observe(page);
     }
+    // Log the final state after the poll loop for debugging
+    log(`post-creds loop ended with step=${postLoginObs.step} url=${postLoginObs.url}`);
 
     if (postLoginObs.step === 'invalid-credentials') {
       log(`MCA rejected credentials: ${postLoginObs.errorMessage}`);
@@ -363,8 +402,15 @@ export async function runAoc4Job(job: Aoc4Job, opts: { artifactDir: string; skip
       let observedLoggedIn = false;
 
       while (Date.now() - otpStart < OTP_TIMEOUT_MS) {
-        // Always try to dismiss the popup first
-        await _dismissAlreadyLoggedInPopup(page).catch(() => {});
+        // Always try to dismiss the "already logged in" popup first — MCA can
+        // show it after OTP validation, at which point observe() would return
+        // 'session-conflict' (or 'login-form' if the overlay doesn't fully hide
+        // the login form).  Auto-dismiss so the flow can complete.
+        const midOtpDismissed = await _dismissAlreadyLoggedInPopup(page).catch(() => false);
+        if (midOtpDismissed) {
+          log('dismissed "already logged in" popup during OTP wait — giving MCA 3s to transition');
+          await page.waitForTimeout(3000);
+        }
 
         // Did the API receive an OTP?
         if (!otpFilled) {

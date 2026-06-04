@@ -12,6 +12,7 @@ export type CurrentStep =
   | 'otp'
   | 'invalid-credentials'
   | 'logged-in'
+  | 'session-conflict'  // "already logged in elsewhere" popup — must click Yes to continue
   | 'login-form'
   | 'unknown';
 
@@ -89,6 +90,17 @@ export async function observe(page: Page): Promise<LoginObservation> {
   if (hasAuth) {
     return { step: 'logged-in', url };
   }
+
+  // "Already logged in elsewhere" / session conflict modal.
+  // MUST be checked BEFORE login-form: MCA renders this as an overlay while the
+  // login form stays in the DOM, so LOGIN.USER_ID.isVisible() still returns true
+  // and would incorrectly report 'login-form', confusing the entire login flow.
+  const sessionConflict = await page
+    .locator('text=/already\\s*(logged\\s*in|have\\s*an)|active\\s*session|end\\s*that\\s*session|logging\\s*in\\s*here\\s*again/i')
+    .first()
+    .isVisible()
+    .catch(() => false);
+  if (sessionConflict) return { step: 'session-conflict', url };
 
   // Login form still showing
   const userIdVisible = await page.locator(LOGIN.USER_ID).isVisible().catch(() => false);
