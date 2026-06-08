@@ -313,6 +313,17 @@ const server = http.createServer(async (req, res) => {
           const msg = e instanceof Error ? e.message : String(e);
           process.stderr.write(`[server] job ${jobId} THREW: ${msg}\n`);
           try { setPhase(jobId, 'FAILED', { error: msg }); } catch { /* */ }
+        } finally {
+          // GUARANTEED browser close — no matter how the job ended (success,
+          // throw, or an internal early-return that forgot to close). Prevents
+          // zombie Chromium processes from piling up on the host (an RDP) and
+          // starving resources, which makes later form loads time out.
+          try {
+            const br = job._browser;
+            if (br) { await br.close().catch(() => { /* already closed */ }); }
+          } catch { /* never let cleanup throw */ }
+          job._browser = undefined;
+          job._page = undefined;
         }
       });
 

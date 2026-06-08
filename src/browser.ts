@@ -65,7 +65,21 @@ export async function launch(opts: LaunchOptions = {}): Promise<{ browser: Brows
   const storagePath = opts.storageStatePath ?? env('STORAGE_STATE_PATH', './storage-state.json')!;
   const loadSession = opts.loadSession ?? true;
 
-  const browser = await chromium.launch({ headless, slowMo });
+  // Anti-bot flags. MCA sits behind Akamai, which fingerprints headless Chrome
+  // (navigator.webdriver, the AutomationControlled blink feature, etc.) and can
+  // serve a challenge/blank page where the AEM login form never renders — which
+  // is exactly the "username field never appeared" failure seen ONLY in headless.
+  // These flags + the webdriver mask below make headless look like a normal browser.
+  const browser = await chromium.launch({
+    headless,
+    slowMo,
+    args: [
+      '--disable-blink-features=AutomationControlled',
+      '--no-sandbox',
+      '--disable-dev-shm-usage',
+      '--disable-features=IsolateOrigins,site-per-process',
+    ],
+  });
   // Track for graceful shutdown; self-remove whenever it closes (any path).
   openBrowsers.add(browser);
   browser.on('disconnected', () => openBrowsers.delete(browser));
@@ -84,6 +98,24 @@ export async function launch(opts: LaunchOptions = {}): Promise<{ browser: Brows
     contextOptions.storageState = storagePath;
   }
   const context = await browser.newContext(contextOptions);
+
+  // Mask the headless fingerprints Akamai checks: navigator.webdriver must be
+  // undefined (Playwright sets it true), and window.chrome / plugins / languages
+  // should look populated. Runs in EVERY page before any site script.
+  await context.addInitScript(() => {
+    try {
+      Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+    } catch { /* */ }
+    try {
+      // Some detectors check for a non-empty plugins/languages list.
+      if (!navigator.languages || navigator.languages.length === 0) {
+        Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+      }
+      // Minimal window.chrome shim (present in real Chrome, absent in headless).
+      const w = window as unknown as { chrome?: unknown };
+      if (!w.chrome) w.chrome = { runtime: {} };
+    } catch { /* */ }
+  });
 
   for (const pattern of BLOCKED_SCRIPT_PATTERNS) {
     await context.route(pattern, (route) => route.abort());
