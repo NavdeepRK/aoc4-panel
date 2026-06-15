@@ -711,7 +711,14 @@ export async function runAoc4Job(job: Aoc4Job, opts: { artifactDir: string; skip
   // Apply panel 1 fills + signatory tables (small-Pvt preset).
   setPhase(jobId, 'FILLING_PANEL', { panelInProgress: 1 });
   await applyPanel1(page, payload);
-  await populateSignatoryTables(page, payload);
+  const sigDebug = await populateSignatoryTables(page, payload);
+  try {
+    fs.writeFileSync(path.join(opts.artifactDir, `${jobId}-signatory-tables-debug.json`), JSON.stringify(sigDebug, null, 2));
+    const d = sigDebug as { dynamicTable1?: { instancesAfterAdd?: number; addAttempts?: Array<{ error: string | null }> }; table2?: { instancesAfterAdd?: number } } | null;
+    const dt1 = d?.dynamicTable1; const t2 = d?.table2;
+    const dt1Err = dt1?.addAttempts?.map(a => a.error).filter(Boolean).join('; ') || 'none';
+    log(`signatory tables: 4c(dynamicTable1) rows=${dt1?.instancesAfterAdd ?? '?'} addErr=[${dt1Err}] | 5b(table2) rows=${t2?.instancesAfterAdd ?? '?'}`);
+  } catch (e) { log(`signatory-tables debug write failed: ${(e as Error)?.message}`); }
 
   // Apply schema-driven panel1 panelOverrides AFTER the legacy applyPanel1 hardcoded
   // values, so anything the SPOC entered in the form (e.g. natureS, agm dates) wins.
@@ -3110,8 +3117,8 @@ async function applyPanel1(page: import('playwright').Page, payload: import('./j
   }, payload);
 }
 
-async function populateSignatoryTables(page: import('playwright').Page, payload: import('./jobs.js').Aoc4FormPayload): Promise<void> {
-  await page.evaluate((p) => {
+async function populateSignatoryTables(page: import('playwright').Page, payload: import('./jobs.js').Aoc4FormPayload): Promise<unknown> {
+  return await page.evaluate((p) => {
     type Inst = Record<string, { somExpression?: string; value?: unknown }>;
     type IM = { _instances: Inst[]; addInstance?: () => void; removeInstance?: (i: number) => void; instanceCount?: number };
     type Table = { Row1?: { _instanceManager: IM } };
@@ -3148,59 +3155,88 @@ async function populateSignatoryTables(page: import('playwright').Page, payload:
       } catch { /* ignore */ }
     };
 
-    // dynamicTable1 — FS signatories (one row per director)
-    // Per panel1-conditional-field-map.json captured on SCALEVERGE test:
-    //   fields_per_row: ['DINorIncome', 'name', 'designation', 'DateOfSigning']
-    // Earlier code used 'table1designation' which is INCORRECT — that field doesn't exist.
-    // Verified live 2026-05-03: with 'table1designation' the form left the Designation
-    // column empty after save ("Please enter the relevant details" error on resume).
-    const dt1 = gb.resolveNode('dynamicTable1') as Table | null;
-    const dt1IM = dt1?.Row1?._instanceManager;
-    if (dt1IM && p.directors.length > 0) {
-      // 4(c) FS signatories — ONE ROW PER DIRECTOR (was previously filling only
-      // the single fsSignerDirectorIndex director, so a 2-director company lost
-      // the second signatory). Mirror the table2 (5b) multi-row logic.
+    // Both signatory tables (4(c) FS-signatories = dynamicTable1, 5(b) Board's-report
+    // signatories = table2) are filled by ONE shared routine so their behaviour can't
+    // diverge at the code level. 4(c) was reported still showing a single row while
+    // 5(b) correctly multi-rows despite identical logic — so this captures rich
+    // per-table diagnostics (the actual addInstance error, the instance-manager's
+    // occurrence limits, per-row fill status) to pinpoint why dynamicTable1.addInstance
+    // behaves differently at runtime. Field maps verified via the live introspect:
+    //   dynamicTable1.Row1: DINorIncome / designation / DateOfSigning
+    //   table2.Row1:        din        / designation1 / DateOfSigningOfBoard
+    // (name auto-fetches via AEM's valueCommitScript on DIN entry — not set here.)
+    type DbgAttempt = { before: number; after: number; variant: string; error: string | null };
+    type DbgTable = {
+      table: string; nodeResolved: boolean; imResolved: boolean; directors: number;
+      target: number; instancesBefore: number; imKeys: string[];
+      imOccur: Record<string, unknown>; addAttempts: DbgAttempt[];
+      instancesAfterAdd: number; rowsFilled: Array<Record<string, unknown>>; instancesAfterTrim: number;
+    };
+    const fillSignatoryTable = (
+      tableName: string, dinField: string, desigField: string, dateField: string, dateValue: string,
+    ): DbgTable => {
+      const dbg: DbgTable = {
+        table: tableName, nodeResolved: false, imResolved: false, directors: p.directors.length,
+        target: 0, instancesBefore: 0, imKeys: [], imOccur: {}, addAttempts: [],
+        instancesAfterAdd: 0, rowsFilled: [], instancesAfterTrim: 0,
+      };
+      const node = gb.resolveNode(tableName) as Table | null;
+      dbg.nodeResolved = !!node;
+      const im = node?.Row1?._instanceManager;
+      dbg.imResolved = !!im;
+      if (!im) return dbg;
+      const imAny = im as unknown as Record<string, unknown>;
+      dbg.imKeys = Object.keys(imAny);
+      for (const k of ['maxOccur', 'minOccur', 'maximumOccurrences', 'minimumOccurrences', 'instanceCount', 'min', 'max', 'initialCount']) {
+        if (k in imAny) dbg.imOccur[k] = imAny[k];
+      }
       const target = Math.min(p.directors.length, 5);
-      while (dt1IM._instances.length < target) {
-        try { dt1IM.addInstance?.(); } catch { break; }
+      dbg.target = target;
+      dbg.instancesBefore = im._instances.length;
+      // Add rows until we reach `target`. Stop on a no-op (length unchanged) so a
+      // silently-failing addInstance can't spin forever (the old `catch{break}` only
+      // guarded throws). Try the no-arg form, then the AEM addInstance(true) variant.
+      let guard = 0;
+      while (im._instances.length < target && guard < 12) {
+        guard++;
+        const before = im._instances.length;
+        let err: string | null = null;
+        let variant = 'addInstance()';
+        try { im.addInstance?.(); } catch (e) { err = String((e as Error)?.message ?? e); }
+        if (im._instances.length === before) {
+          variant = 'addInstance(true)';
+          try { (im.addInstance as ((b: boolean) => void) | undefined)?.(true); err = null; }
+          catch (e2) { err = (err ? err + ' | ' : '') + String((e2 as Error)?.message ?? e2); }
+        }
+        dbg.addAttempts.push({ before, after: im._instances.length, variant, error: err });
+        if (im._instances.length === before) break; // genuine no-op — stop, don't hang
       }
+      dbg.instancesAfterAdd = im._instances.length;
       for (let i = 0; i < target; i++) {
-        const row = dt1IM._instances[i];
+        const row = im._instances[i];
         const dir = p.directors[i];
-        if (!row || !dir) continue;
-        if (row.DINorIncome?.somExpression) setVal(row.DINorIncome.somExpression, dir.din);
-        // name auto-fetches via AEM's valueCommitScript on DIN entry — no need to set
-        if (row.designation?.somExpression) setDropdown(row.designation.somExpression, dir.designation);
-        if (row.DateOfSigning?.somExpression) setVal(row.DateOfSigning.somExpression, p.boardMeetingFsApprovalDate);
+        if (!row || !dir) { dbg.rowsFilled.push({ i, hasRow: !!row, hasDir: !!dir }); continue; }
+        const rf: Record<string, unknown> = { i };
+        if (row[dinField]?.somExpression) { setVal(row[dinField].somExpression as string, dir.din); rf.din = true; }
+        if (row[desigField]?.somExpression) { setDropdown(row[desigField].somExpression as string, dir.designation); rf.desig = true; }
+        if (row[dateField]?.somExpression) { setVal(row[dateField].somExpression as string, dateValue); rf.date = true; }
+        dbg.rowsFilled.push(rf);
       }
-      // Trim any extra default rows down to the actual director count
-      for (let i = dt1IM._instances.length - 1; i >= target; i--) {
-        try { dt1IM.removeInstance?.(i); } catch { /* keep going */ }
+      for (let i = im._instances.length - 1; i >= target; i--) {
+        try { im.removeInstance?.(i); } catch { /* keep going */ }
       }
-    }
+      dbg.instancesAfterTrim = im._instances.length;
+      return dbg;
+    };
 
-    // table2 — Board's report signatories (one row per director, max 3 default)
-    const t2 = gb.resolveNode('table2') as Table | null;
-    const t2IM = t2?.Row1?._instanceManager;
-    if (t2IM) {
-      // Add rows if more than 3 directors
-      const target = Math.min(p.directors.length, 5);
-      while (t2IM._instances.length < target) {
-        try { t2IM.addInstance?.(); } catch { break; }
-      }
-      for (let i = 0; i < target; i++) {
-        const row = t2IM._instances[i];
-        const dir = p.directors[i];
-        if (!row || !dir) continue;
-        if (row.din?.somExpression) setVal(row.din.somExpression, dir.din);
-        if (row.designation1?.somExpression) setDropdown(row.designation1.somExpression, dir.designation);
-        if (row.DateOfSigningOfBoard?.somExpression) setVal(row.DateOfSigningOfBoard.somExpression, p.boardMeetingReportDate);
-      }
-      // Trim to actual director count
-      for (let i = t2IM._instances.length - 1; i >= target; i--) {
-        try { t2IM.removeInstance?.(i); } catch { /* keep going */ }
-      }
-    }
+    return {
+      dynamicTable1: p.directors.length > 0
+        ? fillSignatoryTable('dynamicTable1', 'DINorIncome', 'designation', 'DateOfSigning', p.boardMeetingFsApprovalDate)
+        : null,
+      table2: p.directors.length > 0
+        ? fillSignatoryTable('table2', 'din', 'designation1', 'DateOfSigningOfBoard', p.boardMeetingReportDate)
+        : null,
+    };
   }, payload);
 }
 
