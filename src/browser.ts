@@ -77,6 +77,8 @@ export async function launch(opts: LaunchOptions = {}): Promise<{ browser: Brows
       '--disable-blink-features=AutomationControlled',
       '--no-sandbox',
       '--disable-dev-shm-usage',
+      '--disable-gpu',
+      '--disable-software-rasterizer',
       '--disable-features=IsolateOrigins,site-per-process',
     ],
   });
