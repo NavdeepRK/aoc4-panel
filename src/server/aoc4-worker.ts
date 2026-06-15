@@ -3148,10 +3148,7 @@ async function populateSignatoryTables(page: import('playwright').Page, payload:
       } catch { /* ignore */ }
     };
 
-    const fsIdx = p.fsSignerDirectorIndex ?? 0;
-    const fs = p.directors[fsIdx];
-
-    // dynamicTable1 — FS signatories (1 row for small Pvt)
+    // dynamicTable1 — FS signatories (one row per director)
     // Per panel1-conditional-field-map.json captured on SCALEVERGE test:
     //   fields_per_row: ['DINorIncome', 'name', 'designation', 'DateOfSigning']
     // Earlier code used 'table1designation' which is INCORRECT — that field doesn't exist.
@@ -3159,14 +3156,25 @@ async function populateSignatoryTables(page: import('playwright').Page, payload:
     // column empty after save ("Please enter the relevant details" error on resume).
     const dt1 = gb.resolveNode('dynamicTable1') as Table | null;
     const dt1IM = dt1?.Row1?._instanceManager;
-    if (dt1IM && fs) {
-      const r0 = dt1IM._instances[0];
-      if (r0?.DINorIncome?.somExpression) setVal(r0.DINorIncome.somExpression, fs.din);
-      // name auto-fetches via AEM's valueCommitScript on DIN entry — no need to set
-      if (r0?.designation?.somExpression) setDropdown(r0.designation.somExpression, fs.designation);
-      if (r0?.DateOfSigning?.somExpression) setVal(r0.DateOfSigning.somExpression, p.boardMeetingFsApprovalDate);
-      // Trim from default 5 rows down to 1
-      for (let i = dt1IM._instances.length - 1; i >= 1; i--) {
+    if (dt1IM && p.directors.length > 0) {
+      // 4(c) FS signatories — ONE ROW PER DIRECTOR (was previously filling only
+      // the single fsSignerDirectorIndex director, so a 2-director company lost
+      // the second signatory). Mirror the table2 (5b) multi-row logic.
+      const target = Math.min(p.directors.length, 5);
+      while (dt1IM._instances.length < target) {
+        try { dt1IM.addInstance?.(); } catch { break; }
+      }
+      for (let i = 0; i < target; i++) {
+        const row = dt1IM._instances[i];
+        const dir = p.directors[i];
+        if (!row || !dir) continue;
+        if (row.DINorIncome?.somExpression) setVal(row.DINorIncome.somExpression, dir.din);
+        // name auto-fetches via AEM's valueCommitScript on DIN entry — no need to set
+        if (row.designation?.somExpression) setDropdown(row.designation.somExpression, dir.designation);
+        if (row.DateOfSigning?.somExpression) setVal(row.DateOfSigning.somExpression, p.boardMeetingFsApprovalDate);
+      }
+      // Trim any extra default rows down to the actual director count
+      for (let i = dt1IM._instances.length - 1; i >= target; i--) {
         try { dt1IM.removeInstance?.(i); } catch { /* keep going */ }
       }
     }
