@@ -413,7 +413,7 @@ export async function runAoc4Job(job: Aoc4Job, opts: { artifactDir: string; skip
     }
 
     // Captcha loop — try up to 3 times: each attempt calls autoSolveCaptcha
-    // (which uses OPENROUTER_API_KEY / TrueCaptcha if configured), polls for
+    // (which uses APIKEY_2CAPTCHA / OPENROUTER_API_KEY if configured), polls for
     // next state, retries if MCA throws a fresh captcha back.
     let captchaAttempts = 0;
     while (postLoginObs.step === 'captcha' && captchaAttempts < 3) {

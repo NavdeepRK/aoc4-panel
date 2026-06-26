@@ -3,42 +3,45 @@ import OpenAI from 'openai';
 const MODEL = process.env.OPENROUTER_MODEL ?? 'google/gemini-2.5-flash';
 
 /**
- * TrueCaptcha (api.apitruecaptcha.org) — primary solver. Same service the GST automation
- * uses; ~95% accuracy on these distorted-character captchas. Needs TRUECAPTCHA_USER and
- * TRUECAPTCHA_KEY env vars (set in `.env`).
+ * 2Captcha (2captcha.com) — primary solver. Human-backed, ~95%+ accuracy on these
+ * distorted-character captchas. Needs APIKEY_2CAPTCHA env var (set in `.env`).
  *
- * MCA's captcha is 6 alphanumeric characters (not numeric like GST), so we DON'T pass
- * `numeric:true` here — let TrueCaptcha return the full alphanumeric result.
+ * Uses the classic in.php/res.php HTTP API directly (no SDK dependency): submit the
+ * base64 PNG, then poll res.php until the worker returns the text. MCA's captcha is 6
+ * alphanumeric chars, so we don't constrain to numeric.
  */
-async function solveCaptchaWithTrueCaptcha(pngBase64: string): Promise<string> {
-  const userid = process.env.TRUECAPTCHA_USER;
-  const apikey = process.env.TRUECAPTCHA_KEY;
-  if (!userid || !apikey) throw new Error('TRUECAPTCHA_USER / TRUECAPTCHA_KEY not set');
+async function solveCaptchaWith2Captcha(pngBase64: string): Promise<string> {
+  const apikey = process.env.APIKEY_2CAPTCHA;
+  if (!apikey) throw new Error('APIKEY_2CAPTCHA not set');
 
-  const body = {
-    userid,
-    apikey,
-    data: pngBase64,
-    mode: process.env.TRUECAPTCHA_MODE ?? 'human',
-    // numeric: false — MCA captcha is alphanumeric
-  };
-
-  const r = await fetch('https://api.apitruecaptcha.org/one/gettext', {
+  // Submit
+  const inResp = await fetch('https://2captcha.com/in.php', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ key: apikey, method: 'base64', body: pngBase64, json: '1' }),
   });
-  if (!r.ok) throw new Error(`TrueCaptcha: HTTP ${r.status} ${r.statusText}`);
-  const j = await r.json() as { result?: string; conf?: number; error_message?: string };
-  if (j.error_message) throw new Error(`TrueCaptcha: ${j.error_message}`);
-  if (!j.result) throw new Error(`TrueCaptcha: no result in response: ${JSON.stringify(j)}`);
+  if (!inResp.ok) throw new Error(`2Captcha in.php: HTTP ${inResp.status} ${inResp.statusText}`);
+  const inJson = await inResp.json() as { status: number; request: string };
+  if (inJson.status !== 1) throw new Error(`2Captcha submit failed: ${inJson.request}`);
+  const id = inJson.request;
 
-  // Strip whitespace and any non-alphanumeric noise the OCR adds.
-  const cleaned = j.result.replace(/[^A-Za-z0-9]/g, '');
-  if (cleaned.length !== 6) {
-    throw new Error(`TrueCaptcha returned ${cleaned.length} chars, expected 6: "${j.result}"`);
+  // Poll (2captcha needs ~5-20s; cap at ~120s)
+  for (let i = 0; i < 24; i++) {
+    await new Promise((r) => setTimeout(r, 5000));
+    const res = await fetch(
+      `https://2captcha.com/res.php?key=${apikey}&action=get&id=${id}&json=1`,
+    );
+    const j = await res.json() as { status: number; request: string };
+    if (j.status === 1) {
+      const cleaned = j.request.replace(/[^A-Za-z0-9]/g, '');
+      if (cleaned.length !== 6) {
+        throw new Error(`2Captcha returned ${cleaned.length} chars, expected 6: "${j.request}"`);
+      }
+      return cleaned;
+    }
+    if (j.request !== 'CAPCHA_NOT_READY') throw new Error(`2Captcha poll failed: ${j.request}`);
   }
-  return cleaned;
+  throw new Error('2Captcha: timed out waiting for result');
 }
 
 const SYSTEM_PROMPT = [
@@ -69,21 +72,21 @@ function client(): OpenAI {
  * Sends a captcha PNG (base64) to whichever solver is configured and returns the 6-character solution.
  *
  * Resolution order:
- *   1. TrueCaptcha (api.apitruecaptcha.org) when TRUECAPTCHA_USER + TRUECAPTCHA_KEY are set.
- *      ~95% accuracy on alphanumeric captchas, what the GST automation uses.
+ *   1. 2Captcha (2captcha.com) when APIKEY_2CAPTCHA is set.
+ *      Human-backed, ~95%+ accuracy on alphanumeric captchas.
  *   2. OpenRouter vision model (default: google/gemini-2.5-flash) when OPENROUTER_API_KEY is set.
  *
  * Throws if neither is configured or both fail.
  */
 export async function solveCaptchaWithVision(pngBase64: string): Promise<string> {
-  // Primary: TrueCaptcha if configured
-  if (process.env.TRUECAPTCHA_USER && process.env.TRUECAPTCHA_KEY) {
-    try { return await solveCaptchaWithTrueCaptcha(pngBase64); }
+  // Primary: 2Captcha if configured
+  if (process.env.APIKEY_2CAPTCHA) {
+    try { return await solveCaptchaWith2Captcha(pngBase64); }
     catch (e) {
       // Fall through to vision LLM if available; otherwise propagate
       if (!process.env.OPENROUTER_API_KEY) throw e;
       // eslint-disable-next-line no-console
-      console.warn('[captcha] TrueCaptcha failed, falling back to vision LLM:', (e as Error).message);
+      console.warn('[captcha] 2Captcha failed, falling back to vision LLM:', (e as Error).message);
     }
   }
 

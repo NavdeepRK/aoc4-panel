@@ -139,10 +139,10 @@ export async function waitForLoggedIn(
 ): Promise<LoginObservation> {
   const timeout = opts.timeoutMs ?? 10 * 60_000;
   const poll = opts.pollMs ?? 2000;
-  // Auto-solve enabled if EITHER captcha service is configured. TrueCaptcha is the
+  // Auto-solve enabled if EITHER captcha service is configured. 2Captcha is the
   // primary (~95% accuracy), with OpenRouter vision as fallback if both are set.
-  const hasTrueCaptcha = !!(process.env.TRUECAPTCHA_USER && process.env.TRUECAPTCHA_KEY);
-  const auto = opts.autoSolveCaptcha ?? (hasTrueCaptcha || !!process.env.OPENROUTER_API_KEY);
+  const has2Captcha = !!process.env.APIKEY_2CAPTCHA;
+  const auto = opts.autoSolveCaptcha ?? (has2Captcha || !!process.env.OPENROUTER_API_KEY);
   const captchaAttempts = opts.captchaMaxAttempts ?? 3;
   const deadline = Date.now() + timeout;
   let lastStep: CurrentStep | null = null;
