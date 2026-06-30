@@ -84,8 +84,14 @@ export async function observe(page: Page): Promise<LoginObservation> {
     .catch(() => false);
   if (conflictYesVisible || conflictTextVisible) return { step: 'session-conflict', url };
 
+  // Live OTP page (artifact login-stalled-unknown.html) reads:
+  //   "Please enter the OTP sent to your registered mobile number … or email ID …"
+  // The old /enter\s*otp/ required "enter" and "otp" adjacent, so the "the" in
+  // "enter the OTP" made it miss → observe() returned 'unknown' on a visible OTP
+  // page and the worker crashed before OTP_PENDING. "otp sent to" is unique to
+  // this page (the login form never says it), so it's the reliable marker.
   const otpVisible = await page
-    .getByText(/one\s*time\s*password|enter\s*otp|verify\s*otp/i)
+    .getByText(/one\s*time\s*password|otp\s*sent\s*to|enter\s*\w*\s*otp|verify\s*otp/i)
     .first()
     .isVisible()
     .catch(() => false);

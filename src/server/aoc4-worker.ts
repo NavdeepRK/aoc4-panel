@@ -429,6 +429,16 @@ export async function runAoc4Job(job: Aoc4Job, opts: { artifactDir: string; skip
       // If still captcha, MCA rejected the solve — loop will retry with a fresh image
     }
 
+    // After a SOLVED captcha, MCA needs a few seconds to render the OTP page and
+    // briefly shows an intermediate/loading state that observe() reports as
+    // 'unknown'. A single read here bailed with step=unknown → FAILED. Poll for the
+    // real next state (otp/logged-in/invalid) instead of giving up on first read.
+    for (let i = 0; i < 40 && !['otp', 'logged-in', 'invalid-credentials', 'captcha'].includes(postLoginObs.step); i++) {
+      await _dismissAlreadyLoggedInPopup(page).catch(() => false);
+      await page.waitForTimeout(700);
+      postLoginObs = await observe(page);
+    }
+
     if (postLoginObs.step === 'captcha') {
       log('captcha unsolved after 3 attempts');
       setPhase(jobId, 'FAILED', { error: 'Captcha auto-solve failed — set OPENROUTER_API_KEY in worker .env, or solve manually in the headed browser' });
@@ -437,8 +447,13 @@ export async function runAoc4Job(job: Aoc4Job, opts: { artifactDir: string; skip
     }
 
     if (postLoginObs.step === 'otp') {
+      // OTP wait budget. The full round-trip is slow (MCA lags to the OTP page →
+      // we prompt the SPOC on the erp portal → they enter it → we relay + submit →
+      // MCA confirms), so 5 min was timing out. Generous default, env-overridable.
+      const OTP_TIMEOUT_MS = Number(process.env.OTP_TIMEOUT_MS) || 15 * 60 * 1000;
+      const otpTimeoutMin = Math.round(OTP_TIMEOUT_MS / 60000);
       setPhase(jobId, 'OTP_PENDING');
-      log('OTP page reached — waiting for SPOC OTP via POST /jobs/' + jobId + '/otp OR direct browser entry (5 min timeout)');
+      log(`OTP page reached — waiting for SPOC OTP via POST /jobs/${jobId}/otp OR direct browser entry (${otpTimeoutMin} min timeout)`);
 
       // Race three outcomes (whichever happens first wins):
       //   1. SPOC POSTed OTP to /jobs/:id/otp  → worker fills it via Playwright
@@ -449,7 +464,6 @@ export async function runAoc4Job(job: Aoc4Job, opts: { artifactDir: string; skip
       //
       // We also auto-dismiss the "already logged in" popup mid-OTP since MCA
       // sometimes shows it on the OTP page too.
-      const OTP_TIMEOUT_MS = 5 * 60 * 1000;
       const otpStart = Date.now();
       let otpFilled = false;
       let observedLoggedIn = false;
@@ -501,8 +515,8 @@ export async function runAoc4Job(job: Aoc4Job, opts: { artifactDir: string; skip
 
       if (!observedLoggedIn) {
         const msg = otpFilled
-          ? 'OTP was submitted but MCA never confirmed logged-in state within 5 min'
-          : 'OTP timeout (5 min) — SPOC never submitted OTP via the portal prompt';
+          ? `OTP was submitted but MCA never confirmed logged-in state within ${otpTimeoutMin} min`
+          : `OTP timeout (${otpTimeoutMin} min) — SPOC never submitted OTP via the portal prompt`;
         log(msg);
         setPhase(jobId, 'FAILED', { error: msg });
         await browser.close().catch(() => {});
@@ -832,6 +846,23 @@ export async function runAoc4Job(job: Aoc4Job, opts: { artifactDir: string; skip
     try {
       const text = await siebelResp.text();
       fs.writeFileSync(path.join(opts.artifactDir, `${jobId}-siebel-response.json`), text);
+      // Surface an HTTP-level rejection BEFORE parsing (the body is an Apache 400
+      // error page, not JSON, so JSON.parse would throw and bury the real cause).
+      // A 400 "could not understand the request" here is the web server rejecting
+      // the save POST as malformed — almost always an oversized request header
+      // (accumulated session cookies), NOT a form-field change. Log the cookie size
+      // so the cause is unambiguous on the next run.
+      const httpStatus = siebelResp.status();
+      const reqCookie = siebelResp.request().headers()['cookie'] ?? '';
+      log(`Siebel save HTTP ${httpStatus}; request cookie header = ${reqCookie.length} bytes / ${reqCookie ? reqCookie.split(';').length : 0} cookies`);
+      if (httpStatus >= 400) {
+        setPhase(jobId, 'FAILED', {
+          error: `Panel 1 save rejected at the HTTP layer (status ${httpStatus}) — malformed save request, ` +
+            `likely an oversized cookie header (${reqCookie.length} bytes). This is a transport issue, not a form-field change.`,
+        });
+        await browser.close().catch(() => {});
+        return;
+      }
       const outer = JSON.parse(text) as { resStr?: string };
       if (typeof outer.resStr === 'string') {
         const inner = JSON.parse(outer.resStr) as { message?: string; data?: { integrationId?: string; referenceNumber?: string; SRFOStatus?: string; formIntegrationId?: string } };
